@@ -17,10 +17,29 @@ class LocalMailSource(BaseMailSource):
     def __init__(self, *args, **kwargs):
         BaseMailSource.__init__(self, *args, **kwargs)
         if not self.my_config.name:
-            self.my_config.name = _('Local mailboxes')
+            self.my_config.name = _('Local mail')
+        self.recently_changed = []
         self.my_config.protocol = 'local'  # We may be upgrading an old
                                            # mbox or maildir source.
         self.watching = -1
+
+    def _sleeping_is_ok(self, slept):
+        if slept > 5:
+            #
+            # If any of the most recently changed mailboxes has changed
+            # again, cut our sleeps short after 5 seconds. By basing this
+            # on recently changed mailboxes, we don't need to explicitly
+            # ask the user which mailbox(es) are being used as Inboxes.
+            #
+            # The number 10 should be "big enough", without us going
+            # nuts and scanning a gazillion mailboxes every second.
+            #
+            if len(self.recently_changed) > 10:
+                self.recently_changed = self.recently_changed[-10:]
+            for mbx in self.recently_changed:
+                if self._has_mailbox_changed(mbx, {}):
+                    return False
+        return True
 
     def close(self):
         pass
@@ -46,36 +65,59 @@ class LocalMailSource(BaseMailSource):
               and os.path.isdir(os.path.join(path, d))]
         return (len(ds) == 1) and os.path.join(path, ds[0], 'Data')
 
-    def _has_mailbox_changed(self, mbx, state):
+    def _data_paths(self, mbx):
         mbx_path = FilePath(self._path(mbx)).raw_fp
+        if os.path.exists(mbx_path):
+            yield mbx_path
 
-        # This is common to all local mailboxes, check the mtime/size
-        try:
-            mt = long(os.path.getmtime(mbx_path))
-            sz = long(os.path.getsize(mbx_path))
-        except (OSError, IOError):
-            mt = sz = (int(time.time()) // 7200)  # Guarantee rescans
-        mtsz = state['mtsz'] = '%s/%s' % (mt, sz)
-
-        # Check more carefully if it's a Maildir, Mac Maildir or WERVD.
         if os.path.isdir(mbx_path):
-            for sub in ('cur', 'new', 'tmp', 'Info.plist', 'wervd.ver'):
-                if sub == 'Info.plist':
-                    sub_path = self._get_macmaildir_data(mbx_path)
-                    if not sub_path:
-                        continue
-                else:
-                    sub_path = os.path.join(mbx_path, sub)
-                try:
-                    mt = long(os.path.getmtime(sub_path))
-                    sz = long(os.path.getsize(sub_path))
-                    sub_mtsz = '%s/%s' % (mt, sz)
-                    mtsz += ',' + sub_mtsz
-                    state['mtsz'] += ',' + sub_mtsz
-                except (OSError, IOError):
-                    pass
+            # Maildir, WERVD
+            for s in ('cur', 'new', 'tmp', 'wervd.ver'):
+                sub_path = os.path.join(mbx_path, s)
+                if os.path.exists(sub_path):
+                    yield sub_path
 
-        return (mtsz != self.event.data.get('mailbox_state', {}).get(mbx._key))
+            # Mac Maildir
+            sub_path = self._get_macmaildir_data(mbx_path)
+            if sub_path:
+                yield sub_path
+
+    def _mailbox_sort_key(self, mbx):
+        # Sort mailboxes so the most recently modified get scanned first.
+        mt = 0
+        for p in self._data_paths(mbx):
+            try:
+                mt = max(mt, os.path.getmtime(p))
+            except (OSError, IOError):
+                pass
+        if mt:
+            return '%20.20d' % (0x10000000000 - long(mt))
+        else:
+            return BaseMailSource._mailbox_sort_key(self, mbx)
+
+    def _has_mailbox_changed(self, mbx, state):
+        mtszs = []
+        for p in self._data_paths(mbx):
+            try:
+                mt = long(os.path.getmtime(p))
+                sz = long(os.path.getsize(p))
+                mtszs.append('%s/%s' % (mt, sz))
+            except (OSError, IOError):
+                pass
+
+        if not mtszs:
+            # Try to rescan even if the above fails for some reason
+            mt = sz = (int(time.time()) // 7200)
+            mtszs = ['%s/%s' % (mt, sz)]
+
+        mtsz = state['mtsz'] = ','.join(mtszs)
+        if (mtsz != self.event.data.get('mailbox_state', {}).get(mbx._key)):
+            while mbx in self.recently_changed:
+                self.recently_changed.remove(mbx)
+            self.recently_changed.append(mbx)
+            return True
+        else:
+            return False
 
     def _mark_mailbox_rescanned(self, mbx, state):
         if 'mailbox_state' in self.event.data:

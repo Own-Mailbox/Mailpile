@@ -32,10 +32,22 @@
 import datetime
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
 import traceback
+
+try:
+    import cryptography
+    import cryptography.hazmat.backends
+    import cryptography.hazmat.primitives.hashes
+    try:
+        import cryptography.x509 as cryptography_x509
+    except ImportError:
+        cryptography_x509 = None
+except ImportError:
+    cryptography = None
 
 # Import SOCKS proxy support...
 try:
@@ -50,7 +62,8 @@ import mailpile.security as security
 from mailpile.i18n import gettext
 from mailpile.i18n import ngettext as _n
 from mailpile.commands import Command
-from mailpile.util import dict_merge, monkey_patch
+from mailpile.util import md5_hex, dict_merge, monkey_patch
+from mailpile.security import tls_sock_cert_sha256
 
 
 _ = lambda s: s
@@ -69,7 +82,9 @@ monkey_lock = threading.RLock()
 def _explain_encryption(sock):
     try:
         algo, proto, bits = sock.cipher()
-        return _('%(tls_version)s (%(bits)s bit %(algorithm)s)') % {
+        return (
+            _('%(tls_version)s (%(bits)s bit %(algorithm)s)')
+        ) % {
             'bits': bits,
             'tls_version': proto,
             'algorithm': algo}
@@ -281,6 +296,8 @@ class BaseConnectionBroker(Capability):
 
     def create_conn_with_caps(self, address, context, need, reject,
                               *args, **kwargs):
+        if context.address is None:
+            context.address = address
         conn = self._check(need, reject)._create_connection(context, address,
                                                             *args, **kwargs)
         return self._describe(context, conn)
@@ -336,11 +353,15 @@ class TcpConnectionBroker(BaseConnectionBroker):
         #        INCOMING_INTERNET capability.
 
     def _describe(self, context, conn):
-        (host, port) = conn.getpeername()[:2]
-        if host.lower() in self.LOCAL_NETWORKS:
-            context.on_localnet = True
-        else:
-            context.on_internet = True
+        try:
+            (host, port) = conn.getpeername()[:2]
+            if host.lower() in self.LOCAL_NETWORKS:
+                context.on_localnet = True
+            else:
+                context.on_internet = True
+        except TypeError:
+            # conn.getpeername() may return None
+            pass
         context.encryption = None
         return conn
 
@@ -538,7 +559,6 @@ class BaseConnectionBrokerProxy(TcpConnectionBroker):
     SUPPORTS = []
     WANTS = [Capability.OUTGOING_RAW]
     REJECTS = None
-    SSL_VERSION = None
 
     def _proxy_address(self, address):
         return address
@@ -549,8 +569,7 @@ class BaseConnectionBrokerProxy(TcpConnectionBroker):
     def _wrap_ssl(self, conn):
         if self._debug is not None:
             self._debug('%s: Wrapping socket with SSL' % (self, ))
-        # FIXME: We're losing the SNI stuff here, which is super lame.
-        return ssl.wrap_socket(conn, None, None, ssl_version=self.SSL_VERSION)
+        return ssl.wrap_socket(conn)
 
     def _create_connection(self, context, address, *args, **kwargs):
         address = self._proxy_address(address)
@@ -657,7 +676,9 @@ class MasterBroker(BaseConnectionBroker):
         else:
             history_event[-1] = context
 
-        context.address = address
+        if context.address is None:
+            context.address = address
+
         et = v = t = None
         for prio, cb in self.brokers:
             try:
@@ -716,6 +737,249 @@ class NetworkHistory(Command):
                              result=Master.history)
 
 
+class GetTlsCertificate(Command):
+    """Fetch and parse a server's TLS certificate"""
+    SYNOPSIS = (None, 'crypto/tls/getcert', 'crypto/tls/getcert', '[--tofu-save|--tofu-clear]')
+    ORDER = ('Internals', 6)
+    CONFIG_REQUIRED = False
+    IS_USER_ACTIVITY = False
+    HTTP_CALLABLE = ('GET', 'POST')
+    HTTP_QUERY_VARS = {
+        'tofu-clear': 'Remove from TOFU certificate store',
+        'tofu-save': 'Save to our TOFU certificate store',
+        'host': 'Name of remote server'
+    }
+
+    class CommandResult(Command.CommandResult):
+        def as_text(self):
+            if self.result:
+                def fmt(h, r):
+                    return '%s:\t%s' % (h, r[-1] or r[1])
+                return '\n'.join(fmt(h, r) for h, r in self.result.iteritems())
+            return _('No certificates found')
+
+    def command(self):
+        if self.data.get('_method', 'POST') != 'POST':
+            # Allow HTTP GET as a no-op, so the user can see a friendly form.
+            return self._success(_('Examine TLS certificates'))
+
+        config = self.session.config
+        tofu_save = self.data.get('tofu-save', '--tofu-save' in self.args)
+        tofu_clear = self.data.get('tofu-clear', '--tofu-clear' in self.args)
+        hosts = (list(s for s in self.args if not s.startswith('--')) +
+                 self.data.get('host', []))
+
+        def ts(t):
+            return int(time.mktime(t.timetuple()))
+
+        def oidName(oid):
+            return {
+                '2.5.4.3': 'commonName',
+                '2.5.4.4': 'surname',
+                '2.5.4.5': 'serialNumber',
+                '2.5.4.6': 'countryName',
+                '2.5.4.7': 'localityName',
+                '2.5.4.8': 'stateOrProvinceName',
+                '2.5.4.9': 'streetAddress',
+                '2.5.4.10': 'organizationName',
+                '2.5.4.11': 'organizationalUnitName'
+                }.get(oid.dotted_string,
+                      getattr(oid, '_name', oid.dotted_string))
+
+        def oidmap(entries):
+            return dict((oidName(e.oid), e.value) for e in entries)
+
+        def subjmap(stext):
+            def subjpair(kv):
+                k, v = kv.split('=', 1)
+                return ({'CN': 'commonName',
+                         'C': 'countryName',
+                         'ST': 'stateOrProvinceName',
+                         'L': 'localityName',
+                         'O': 'organizationName',
+                         'OU': 'organizationalUnitName'}.get(k, k), v)
+            parts = []
+            for part in stext.strip().split('/'):
+                if '=' in part:
+                    parts.append(part)
+                elif parts:
+                    parts[-1] += '/' + part
+            return dict(subjpair(kv) for kv in parts)
+
+        def fingerprint(cert_sha_256):
+            fp = ['%2.2x' % ord(b) for b in cert_sha_256]
+            fp2 = [fp[i*2] + fp[i*2 + 1] for i in range(0, len(fp)/2)]
+            return fp2
+
+        def pts(t):
+            dt, tz = t.rsplit(' ', 1)  # Strip off the timezone
+            return datetime.datetime.strptime(dt, '%b %d %H:%M:%S %Y')
+
+        def parse_pem_cert(cert_pem, s256):
+            cert_sha_256 = s256.decode('base64')
+            now = datetime.datetime.today()
+            if cryptography_x509 is None:
+                # Shell out to openssl, boo.
+                (stdout, stderr) = subprocess.Popen(
+                    ['openssl', 'x509',
+                        '-subject', '-issuer', '-dates', '-noout'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE).communicate(input=str(cert_pem))
+                if not stdout:
+                    raise ValueError(stderr)
+                details = dict(l.split('=', 1)
+                               for l in stdout.strip().splitlines()
+                               if l and '=' in l)
+                details['notAfter'] = pts(details['notAfter'])
+                details['notBefore'] = pts(details['notBefore'])
+                return {
+                    'fingerprint': fingerprint(cert_sha_256),
+                    'date_matches': False,
+                    'date_matches': ((details['notBefore'] < now) and
+                                     (details['notAfter'] > now)),
+                    'not_valid_before': ts(details['notBefore']),
+                    'not_valid_after': ts(details['notAfter']),
+                    'subject': subjmap(details['subject']),
+                    'issuer': subjmap(details['issuer'])}
+            else:
+                parsed = cryptography_x509.load_pem_x509_certificate(
+                    str(cert_pem),
+                    cryptography.hazmat.backends.default_backend())
+                return {
+                    'fingerprint': fingerprint(cert_sha_256),
+                    'date_matches': ((parsed.not_valid_before < now) and
+                                     (parsed.not_valid_after > now)),
+                    'not_valid_before': ts(parsed.not_valid_before),
+                    'not_valid_after': ts(parsed.not_valid_after),
+                    'subject': oidmap(parsed.subject),
+                    'issuer': oidmap(parsed.issuer)}
+
+        def attempt_starttls(addr, sock):
+            # Attempt a minimal SMTP interaction, for STARTTLS support
+
+            # We attempt a non-blocking peek unless we're sure this is
+            # a port normally used for clear-text SMTP.
+            peeking = int(addr[1]) not in (25, 587, 143)
+
+            # If this isn't a known TLS port, then we sleep a bit to give a
+            # greeting time to arrive.
+            if peeking and int(addr[1]) not in (443, 465, 993, 995):
+                time.sleep(0.4)
+
+            try:
+                # Look for an SMTP (or IMAP) greeting
+                if peeking:
+                    sock.setblocking(0)
+                    # Note: This will throw a TypeError if we are connected
+                    #       over Tor (or other SOCKS).
+                    first = sock.recv(1024, socket.MSG_PEEK) or ''
+                else:
+                    sock.settimeout(10)
+                    first = sock.recv(1024) or ''
+
+                if first[:4] == '220 ':
+                    # This is an SMTP greeting
+                    if peeking:
+                        sock.setblocking(1)
+                        sock.recv(1024)
+                    sock.sendall('EHLO example.com\r\n')
+                    if (sock.recv(1024) or '')[:1] == '2':
+                        sock.sendall('STARTTLS\r\n')
+                        sock.recv(1024)
+
+                elif first[:4] == '* OK':
+                    # This is an IMAP4 greeting
+                    if peeking:
+                        sock.setblocking(1)
+                        sock.recv(1024)
+                    sock.sendall('* STARTTLS\r\n')
+                    sock.recv(1024)
+
+            except (TypeError, IOError, OSError):
+                pass
+            finally:
+                sock.setblocking(1)
+
+        certs = {}
+        ok = changes = 0
+        for host in hosts:
+            try:
+                addr = host.replace(' ', '').split(':') + ['443']
+                addr = (addr[0], int(addr[1]))
+
+                try:
+                    with Master.context(need=[Master.OUTGOING_ENCRYPTED,
+                                              Master.OUTGOING_RAW]) as ctx:
+                        sock = socket.create_connection(addr, timeout=30)
+                    attempt_starttls(addr, sock)
+                    ssls = ssl.wrap_socket(sock, use_web_ca=True, tofu=False)
+                    hostname_matches = True
+                    cert_validated = True
+
+                except (ssl.SSLError, ssl.CertificateError) as e:
+                    if isinstance(e, ssl.CertificateError):
+                        cert_validated = True
+                        hostname_matches = False
+                    else:
+                        cert_validated = False
+                        hostname_matches = 'unknown'
+
+                    with Master.context(need=[Master.OUTGOING_ENCRYPTED,
+                                              Master.OUTGOING_RAW]) as ctx:
+                        sock = socket.create_connection(addr, timeout=30)
+                    attempt_starttls(addr, sock)
+                    ssls = ssl.wrap_socket(sock, use_web_ca=False, tofu=False)
+
+                cert = ssls.getpeercert(True)
+                s256 = tls_sock_cert_sha256(cert=cert)
+                ssls.close()
+
+                cfg_key = md5_hex('%s:%d' % addr)
+                if tofu_clear:
+                    if cfg_key in config.tls.keys():
+                        del config.tls[cfg_key]
+                        changes += 1
+                if tofu_save:
+                    if cfg_key not in config.tls.keys():
+                        config.tls[cfg_key] = {'server': '%s:%d' % addr}
+                    cert_tofu = config.tls[cfg_key]
+                    cert_tofu.use_web_ca = False
+                    cert_tofu.accept_certs.append(s256)
+                    changes += 1
+                else:
+                    cert_tofu = config.tls.get(cfg_key, {})
+
+                tofu_seen = s256 in cert_tofu.get('accept_certs', [])
+                using_tofu = not cert_tofu.get('use_web_ca', True)
+                cert = {
+                    'current_time': int(time.time()),
+                    'cert_validated': cert_validated,
+                    'hostname_matches': hostname_matches,
+                    'tofu_seen': tofu_seen,
+                    'using_tofu': using_tofu,
+                    'tofu_invalid': (using_tofu and not tofu_seen),
+                    'pem': ssl.DER_cert_to_PEM_cert(cert)}
+
+                cert.update(parse_pem_cert(cert['pem'], s256))
+
+                certs[host] = (True, s256, cert, None)
+                ok += 1
+            except Exception as e:
+                certs[host] = (
+                    False, _('Failed to fetch certificate'), unicode(e),
+                    traceback.format_exc())
+
+        if changes:
+            self._background_save(config=True)
+
+        if ok:
+            return self._success(_('Downloaded TLS certificates'),
+                                 result=certs)
+        else:
+            return self._error(_('Failed to download TLS certificates'),
+                               result=certs)
+
+
 def SslWrapOnlyOnce(org_sslwrap, sock, *args, **kwargs):
     """
     Since we like to wrap things our own way, this make ssl.wrap_socket
@@ -724,9 +988,11 @@ def SslWrapOnlyOnce(org_sslwrap, sock, *args, **kwargs):
     if not isinstance(sock, ssl.SSLSocket):
         ctx = Master.get_fd_context(sock.fileno())
         try:
+            if 'server_hostname' not in kwargs:
+                kwargs['server_hostname'] = ctx.address[0]
             sock = org_sslwrap(sock, *args, **kwargs)
             ctx.encryption = _explain_encryption(sock)
-        except (socket.error, IOError), e:
+        except (socket.error, IOError, ssl.SSLError, ssl.CertificateError), e:
             ctx.error = '%s' % e
             raise
     return sock
@@ -765,7 +1031,7 @@ if __name__ != "__main__":
 
     from mailpile.plugins import PluginManager
     _plugins = PluginManager(builtin=__file__)
-    _plugins.register_commands(NetworkHistory)
+    _plugins.register_commands(NetworkHistory, GetTlsCertificate)
 
 else:
     import doctest

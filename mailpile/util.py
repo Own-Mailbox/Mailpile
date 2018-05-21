@@ -3,20 +3,24 @@
 # Misc. utility functions for Mailpile.
 #
 import cgi
+import copy
+import ctypes
 import datetime
 import hashlib
 import inspect
 import locale
+import os
+import platform
 import random
 import re
-import subprocess
-import os
-import sys
 import string
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import StringIO
+import cStringIO
 from distutils import spawn
 
 from mailpile.i18n import gettext as _
@@ -25,7 +29,12 @@ from mailpile.safe_popen import Popen, PIPE
 
 
 try:
-    from PIL import Image
+    import imgsize
+except:
+    imgsize = None
+
+try:
+    from PIL import Image, ExifTags
 except:
     Image = None
 
@@ -214,6 +223,10 @@ class AccessError(Exception):
     pass
 
 
+class InternalError(AssertionError):
+    pass
+
+
 class UrlRedirectException(Exception):
     """An exception indicating we need to redirecting to another URL."""
     def __init__(self, url):
@@ -243,6 +256,12 @@ class MultiContext:
                 raised.append(e)
         if raised:
             raise raised[0]
+
+
+def safe_assert(check, *args):
+    """A safe-to-use assert() replacement that never gets compiled out."""
+    if not check:
+        raise InternalError(*args)
 
 
 def thread_context_push(**kwargs):
@@ -416,6 +435,20 @@ def b36(number):
     return ''.join(reversed(base36))
 
 
+def string_to_rank(text, maxint=sys.maxint):
+    """
+    Approximate lexographical order with an int. It's accurate near
+    the front of the string, but gets fuzzy towards letter 10.
+    """
+    rs = CleanText(text, banned=CleanText.NONALNUM).clean.lower()
+    rank = 0.0
+    frac = 1.0
+    for pos in range(0, min(15, len(rs))):
+        rank += frac * (int(rs[pos], 36) / (36.0 + 0.09 * pos))
+        frac *= 1.0 / (36-pos)
+    return long(rank * (maxint - 100)) + min(100, len(text))
+
+
 def string_to_intlist(text):
     """Converts a string into an array of integers"""
     try:
@@ -430,6 +463,24 @@ def intlist_to_string(intlist):
         return chars.decode('utf-8')
     except (UnicodeEncodeError, UnicodeDecodeError):
         return chars
+
+
+def intlist_to_bitmask(intlist):
+    if not intlist:
+        return str('\0')
+    bitmask = [0] * (max(intlist) // 8 + 1)
+    for r in intlist:
+        bitmask[r//8] |= 1 << (r % 8)
+    return ''.join(chr(b) for b in bitmask)
+
+
+def bitmask_to_intlist(bitmask):
+    results = []
+    for i in range(0, len(bitmask)):
+        v = ord(bitmask[i])
+        if v:
+            results += [(i * 8 + b) for b in range(0, 8) if v & (1 << b)]
+    return results
 
 
 def truthy(txt, default=False, special=None):
@@ -452,6 +503,20 @@ def truthy(txt, default=False, special=None):
         return True
     else:
         return default
+
+
+def try_decode(text, charset, replace=''):
+    # FIXME: We need better heuristics for choosing charsets, as pretty
+    #        much any 8-bit legacy charset will decode pretty much any
+    #        blob of data. At least utf-8 will raise on some things
+    #        (which is why we make it the 1st guess), but still not all.
+    for cs in (charset, 'utf-8', 'iso-8859-1'):
+        if cs:
+            try:
+                return text.decode(cs)
+            except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
+                pass
+    return "".join((i if (ord(i) < 128) else replace) for i in text)
 
 
 def randomish_uid():
@@ -659,7 +724,7 @@ def friendly_number(number, base=1000, decimals=0, suffix='',
 
 def decrypt_and_parse_lines(fd, parser, config,
                             newlines=False, decode='utf-8',
-                            passphrase=None,
+                            passphrase=None, gpgi=None,
                             _raise=IOError, error_cb=None):
     import mailpile.crypto.streamer as cstrm
     symmetric_key = config and config.master_key or 'missing'
@@ -685,7 +750,8 @@ def decrypt_and_parse_lines(fd, parser, config,
                     [line], fd,
                     name='decrypt_and_parse',
                     mep_key=symmetric_key,
-                    gpg_pass=passphrase_reader) as pdsfd:
+                    gpg_pass=passphrase_reader,
+                    gpgi=gpgi) as pdsfd:
                 _parser(pdsfd)
                 if not pdsfd.verify(_raise=_raise) and error_cb:
                     error_cb(fd.tell())
@@ -726,6 +792,19 @@ def backup_file(filename, backups=5, min_age_delta=0):
                     os.remove(nbf)
                 os.rename(bf, nbf)
         os.rename(filename, '%s.1' % filename)
+
+
+# Thanks to:
+# https://stackoverflow.com/questions/51658/cross-platform-space-remaining-on-volume-using-python
+def get_free_disk_bytes(dirname):
+    """Return folder/drive free space in bytes"""
+    if platform.system().lower().startswith('win'):
+        free_bytes = ctypes.c_ulonglong(0)
+        ctypes.windll.kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(dirname), None, None, ctypes.pointer(free_bytes))
+        return free_bytes.value
+    else:
+        st = os.statvfs(dirname)
+        return st.f_bavail * st.f_frsize
 
 
 def json_helper(obj):
@@ -770,7 +849,12 @@ def dict_merge(*dicts):
 
 def play_nice(niceness):
     if hasattr(os, 'nice'):
-        os.nice(niceness)
+        try:
+            # Note: This fails on WSL (the "native" Ubuntu on Windows)
+            return os.nice(niceness)
+        except OSError:
+            pass
+    # FIXME: Try alternate strategies on other platforms?
 
 
 def play_nice_with_threads(sleep=True, weak=False, deadline=None):
@@ -806,6 +890,72 @@ def play_nice_with_threads(sleep=True, weak=False, deadline=None):
     return delay
 
 
+class PeekableStringIO(StringIO.StringIO):
+    def peek(self, n):
+        StringIO._complain_ifclosed(self.closed)
+        if self.buflist:
+            self.buf += ''.join(self.buflist)
+            self.buflist = []
+        newpos = min(self.pos+n, self.len)
+        r = self.buf[self.pos:newpos]
+        return r
+
+
+SQUISH_MIME_RULES = (
+    # IMPORTANT: Order matters a great deal here! Full mime-types should come
+    #            first, with the shortest codes preceding the longer ones.
+    ('text/plain', 'tp/'),
+    ('text/html', 'h/'),
+    ('application/zip', 'z/'),
+    ('application/json', 'j/'),
+    ('application/pdf', 'p/'),
+    ('application/rtf', 'r/'),
+    ('application/octet-stream', 'o/'),
+    ('application/msword', 'ms/d'),
+    ('application/vnd.ms-excel', 'ms/x'),
+    ('application/vnd.ms-access', 'ms/m'),
+    ('application/vnd.ms-powerpoint', 'ms/p'),
+    ('application/pgp-keys', 'pgp/k'),
+    ('application/pgp-signature', 'pgp/s'),
+    ('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'ms/xx'),
+    ('application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'ms/dx'),
+    ('application/vnd.openxmlformats-officedocument.presentationml.presentation', 'ms/px'),
+    # These are prefixes that apply to many document types
+    ('application/vnd.openxmlformats-officedocument.', 'msx/'),
+    ('application/vnd.', 'vnd/'),
+    ('application/x-', 'x/'),
+    ('application/', '/'),
+    ('video/', 'v/'),
+    ('audio/', 'a/'),
+    ('image/', 'i/'),
+    ('text/', 't/'))
+
+
+def squish_mimetype(mimetype):
+    for prefix, rep in SQUISH_MIME_RULES:
+        if mimetype.startswith(prefix):
+            return rep + mimetype[len(prefix):]
+    return mimetype
+
+
+def unsquish_mimetype(mimetype):
+    for prefix, rep in reversed(SQUISH_MIME_RULES):
+        if mimetype.startswith(rep):
+            return prefix + mimetype[len(rep):]
+    return mimetype
+
+
+def image_size(img_data, pure_python=False):
+    try:
+        if imgsize is not None:
+            return imgsize.get_size(PeekableStringIO(img_data))
+        if Image is not None and not pure_python:
+            return Image.open(cStringIO.StringIO(img_data)).size
+    except (ValueError, imgsize.UnknownSize):
+        pass
+    return None
+
+
 def thumbnail(fileobj, output_fd, height=None, width=None):
     """
     Generates a thumbnail image , which should be a file,
@@ -826,9 +976,25 @@ def thumbnail(fileobj, output_fd, height=None, width=None):
 
     # Ensure the source image is either a file-like object or a StringIO
     if (not isinstance(fileobj, (file, StringIO.StringIO))):
-        fileobj = StringIO.StringIO(fileobj)
+        fileobj = cStringIO.StringIO(fileobj)
 
     image = Image.open(fileobj)
+    fmt = image.format
+
+    # If we have Exif rotation data, make use of it
+    try:
+        for orientation in ExifTags.TAGS.keys():
+            if ExifTags.TAGS[orientation]=='Orientation':
+                break
+        exif=dict(image._getexif().items())
+        if exif[orientation] == 3:
+            image = image.rotate(180, expand=True)
+        elif exif[orientation] == 6:
+            image = image.rotate(270, expand=True)
+        elif exif[orientation] == 8:
+            image = image.rotate(90, expand=True)
+    except (AttributeError, KeyError, IndexError):
+        pass
 
     # defining the size
     if height is None and width is None:
@@ -853,9 +1019,9 @@ def thumbnail(fileobj, output_fd, height=None, width=None):
     # If saving an optimized image fails, save it unoptimized
     # Keep the format (png, jpg) of the source image
     try:
-        image.save(output_fd, format=image.format, quality=90, optimize=1)
+        image.save(output_fd, format=fmt, quality=90, optimize=1)
     except:
-        image.save(output_fd, format=image.format, quality=90)
+        image.save(output_fd, format=fmt, quality=90)
 
     return image
 
@@ -896,7 +1062,7 @@ class CleanText:
                                         set(range(ord('0'), ord('9') + 1)) -
                                         set(range(ord('a'), ord('z') + 1)) -
                                         set(range(ord('A'), ord('Z') + 1)) -
-                                        set([ord('_'), ord('/')]))])
+                                        set([ord('-'), ord('_'), ord('/')]))])
 
     def __init__(self, text, banned='', replace=''):
         self.clean = str("".join([i if (((ord(i) > 31 and ord(i) < 127) or
@@ -924,28 +1090,48 @@ class TimedOut(IOError):
     pass
 
 
+TIMED_THREAD_LOCK = threading.Lock()
+TIMED_THREADS = {}
+
 class RunTimedThread(threading.Thread):
-    def __init__(self, name, func):
+    def __init__(self, name, func, unique=None):
         threading.Thread.__init__(self, target=func)
-        self.name = name
         self.daemon = True
+        self.name = name
+        self.unique = unique
 
     def run_timed(self, timeout):
+        if self.unique:
+            with TIMED_THREAD_LOCK:
+                old_thread = TIMED_THREADS.get(self.unique)
+                if (old_thread is not None) and old_thread.isAlive():
+                    raise TimedOut('Old thread still alive: %s' % self.name)
+                TIMED_THREADS[self.unique] = self
+
         self.start()
         self.join(timeout=timeout)
+
         if self.isAlive() or QUITTING:
             raise TimedOut('Timed out: %s' % self.name)
+        else:
+            if self.unique:
+                with TIMED_THREAD_LOCK:
+                    TIMED_THREADS[self.unique] = None
 
 
 def RunTimed(timeout, func, *args, **kwargs):
     result, exception = [], []
+    unique = kwargs.get('unique_thread')
+    if unique:
+        kwargs = copy.copy(kwargs)
+        del kwargs['unique_thread']
     def work():
         try:
             result.append(func(*args, **kwargs))
         except:
             et, ev, etb = sys.exc_info()
             exception.append((et, ev, etb))
-    RunTimedThread(func.__name__, work).run_timed(timeout)
+    RunTimedThread(func.__name__, work, unique=unique).run_timed(timeout)
     if exception:
         t, v, tb = exception[0]
         raise t, v, tb

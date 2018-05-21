@@ -200,6 +200,7 @@ class UserInteraction:
             'even_odd': 'odd',
             'mailpile_size': 0
         }
+        self.valid_csrf_token = lambda t: False
 
         # Short-circuit and avoid infinite recursion in parent logging.
         self.log_parent = log_parent
@@ -575,7 +576,7 @@ class UserInteraction:
         return True
 
     def get_password(self, prompt):
-        if not self.interactive:
+        if not (self.interactive or sys.stdout.isatty()):
             return ''
         with self.term:
             try:
@@ -692,11 +693,11 @@ class RawHttpResponder:
         filename = attributes.get('filename', 'attachment.dat'
                                   ).replace('"', '')
         disposition = attributes.get('disposition', 'attachment')
-        length = attributes['length']
+        length = attributes.get('length')
         request.send_http_response(200, 'OK')
-        headers = [
-            ('Content-Length', length),
-        ]
+        headers = []
+        if length is not None:
+            headers.append(('Content-Length', '%s' % length))
         if disposition and filename:
             encfilename = urllib.quote(filename.encode("utf-8"))
             headers.append(('Content-Disposition',
@@ -734,6 +735,7 @@ class Session(object):
         self.order = None
         self.results = []
         self.searched = []
+        self.search_index = None
         self.last_event_id = None
         self.displayed = None
         self.context = None
@@ -752,13 +754,14 @@ class Session(object):
             self.order = session.order
             self.results = session.results[:]
             self.searched = session.searched[:]
+            self.search_index = session.search_index
             self.displayed = session.displayed
             self.context = session.context
         return self
 
     def get_context(self, update=False):
         if update or not self.context:
-            if self.searched:
+            if self.searched and not self.search_index:
                 sid = self.config.search_history.add(self.searched,
                                                      self.results,
                                                      self.order)
@@ -772,6 +775,7 @@ class Session(object):
             if context.startswith('search:'):
                 s, r, o = self.config.search_history.get(self, context[7:])
                 self.searched, self.results, self.order = s, r, o
+                self.search_index = None
                 self.displayed = None
                 self.context = context
                 return context
@@ -798,7 +802,7 @@ class Session(object):
                         return rv
                 self.wait_lock.wait()
 
-    def error(self, message):
+    def fatal_error(self, message):
         self.ui.error(message)
         if not self.interactive:
             sys.exit(1)

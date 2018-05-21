@@ -64,7 +64,7 @@ class MessageOfTheDay(Command):
     @classmethod
     def update(cls, session):
         if not cls._disable_updates(session):
-            cls(session, arg=['--silent', '--update']).run()
+            cls(session, arg=['--silent', '--check']).run()
 
     def _get(self, url):
         if url.startswith('file:'):
@@ -113,10 +113,10 @@ class MessageOfTheDay(Command):
         if '--update' in self.args:
             motd = None
         elif motd and '--check' in self.args:
-            if motd['_updated'] < time.time() - 23.5 * 3600:
+            if motd['_updated'] < (time.time() - 23.5 * 3600):
                 motd = None
 
-        if not motd:
+        if motd is None:
             if (('--update' not in self.args and self._disable_updates(session))
                     or '--noupdate' in self.args):
                 return self._success('', result={})
@@ -132,9 +132,9 @@ class MessageOfTheDay(Command):
                 motd['_is_new'] = False
                 if (not old_motd
                         or old_motd.get("timestamp") != motd.get("timestamp")):
-                    config.save_pickle(motd, 'last_motd', encrypt=False)
                     motd['_is_new'] = True
                     message = '%s: %s' % (_('Message Of The Day'), _('Updated'))
+                config.save_pickle(motd, 'last_motd', encrypt=False)
             except (IOError, OSError, ValueError):
                 pass
 

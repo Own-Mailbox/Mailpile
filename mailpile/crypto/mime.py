@@ -4,13 +4,15 @@ import re
 import StringIO
 import email.parser
 
+from email import encoders
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 
 from mailpile.crypto.state import EncryptionInfo, SignatureInfo
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
-from mailpile.mail_generator import Generator
+from mailpile.mailutils.generator import Generator
+
 
 ##[ Common utilities ]#########################################################
 
@@ -73,62 +75,77 @@ def _update_text_payload(part, payload, charsets=None):
 ##[ Methods for unwrapping encrypted parts ]###################################
 
 
-def MimeReplaceFilename(header, filename):
+def MimeAttachmentDisposition(part, kind, newpart):
     """
-    Accepts a MIME header containing filename="...".
-    Replaces it with filename.
+    Create a Content-Disposition header for a processed attachment using the
+    original file name if available from the PGP packet, otherwise try
+    stripping the extension from the unprocessed attachment file name.
     """
-    start = header.find('filename=')
-    start = header.find('"', start)
-    end = header.find('"', start+1)+1
+    # Delete embedded \n and \r (shouldn't get_filename() do this itself??).
+    filename = part.get_filename().replace('\n','').replace('\r','')
+    if filename:
+        filename = filename.decode('utf-8', 'replace')
+        part.encryption_info["description"] = _("Decrypted: %s") % filename
 
-    if start > 0 and end > start:
-        headernew = header[:start+1] + filename + header[end-1:]
+    if part.encryption_info.filename:
+         newfilename = part.encryption_info.filename
     else:
-        headernew = header[:]
+        # get_filename() can parse quoted, folded and RFC2231 names.
+        # If there's no filename in Content-Disposition it tries Content-Type.
+        newfilename = filename
+        if 'armored' in kind and newfilename.endswith('.asc'):
+            newfilename = newfilename[:len(newfilename)-len('.asc')]
+        elif newfilename.endswith('.gpg'):
+            newfilename = newfilename[:len(newfilename)-len('.gpg')]
 
-    return headernew
+    # add_header() does quoting, folding, maybe someday RFC2231?.
+    newpart.add_header('Content-Disposition', 'attachment',
+                       filename=newfilename.encode('utf-8'))
 
 
-def MimeTrimFilename(header, extension):
+def MimeReplacePart(part, newpart, keep_old_headers=False):
     """
-    Accepts a MIME header containing filename="...".
-    If the name ends with '.' + extension that ending is trimmed off.
-    """
-    start = header.find('filename=')
-    start = header.find('"', start)
-    end = header.find('"', start+1)+1
-    start = header.find('.'+extension+'"', start, end)
+    Replace a MIME part with new version (decrypted, signature verified, ... ).
+    retaining headers from the old part that are not in the new part. The
+    headers that would be overwritten will be renamed and kept if the
+    keep_old_headers variable is set to a prefix string.
 
-    if start > 0 and end > start:
-        headernew = header[:start] + header[end-1:]
-    else:
-        headernew = header[:]
+    MIME headers (Content-*) get special treatment.
 
-    return headernew
-
-
-def MimeReplacePart(part, newpart):
-    """
-    Replace a MIME part with new version (decrypted, signature verified, ... )
-    retaining headers from the old part that are not in the new part.
-    Headers content-type and content-transfer-encoding get special treatment.
+    Returns a set of the headers that got copied from the new part.
     """
     part.set_payload(newpart.get_payload())
+
+    # Original MIME headers must go, whether we're replacing them or not.
+    for hdr in [k for k in part.keys() if k.lower().startswith('content-')]:
+        del part[hdr]
+
+    # If we're keeping the non-MIME old headers, make copies now before
+    # they get deleted below.
+    if keep_old_headers:
+        if not isinstance(keep_old_headers, str):
+            keep_old_headers = "Old"
+        for h in newpart.keys():
+            headers = (part.get_all(h) or [])
+            if (len(headers) == 1) and (part[h] == newpart[h]):
+                continue
+            for v in headers:
+                part.add_header('X-%s-%s' % (keep_old_headers, h), v)
+
     for h in newpart.keys():
         del part[h]
 
-    # The original encoding and type are never appropriate for a processed part.
-    if 'content-type' in part:
-        del part['content-type']
-    if 'content-transfer-encoding' in part:
-        del part['content-transfer-encoding']
-
+    copied = set([])
     for h, v in newpart.items():
         part.add_header(h, v)
+        if not h.lower().startswith('content-'):
+            copied.add(h)
+
+    return copied
 
 
-def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, depth = 0):
+def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None,
+                     unwrap_attachments=True, require_MDC=True, depth=0):
     """
     This method will replace encrypted and signed parts with their
     contents and set part attributes describing the security properties
@@ -141,6 +158,10 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
 
     part.signature_info = SignatureInfo(parent=psi)
     part.encryption_info = EncryptionInfo(parent=pei)
+
+    part.signed_headers = set([])
+    part.encrypted_headers = set([])
+
     mimetype = part.get_content_type() or 'text/plain'
     disposition = part['content-disposition'] or ""
     encoding = part['content-transfer-encoding'] or ""
@@ -171,7 +192,9 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
             part.signature_info.bubble_up(psi)
 
             # Reparent the contents up, removing the signature wrapper
-            MimeReplacePart(part, payload)
+            hdrs = MimeReplacePart(part, payload,
+                                   keep_old_headers='MH-Renamed')
+            part.signed_headers = hdrs
 
             # Try again, in case we just unwrapped another layer
             # of multipart/something.
@@ -180,6 +203,8 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
                              psi=part.signature_info,
                              pei=part.encryption_info,
                              charsets=charsets,
+                             unwrap_attachments=unwrap_attachments,
+                             require_MDC=require_MDC,
                              depth = depth + 1 )
 
         except (IOError, OSError, ValueError, IndexError, KeyError):
@@ -191,8 +216,9 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
         try:
             preamble, payload = part.get_payload()
 
-            (part.signature_info, part.encryption_info, decrypted
-             ) = crypto_cls().decrypt(payload.as_string())
+            (part.signature_info, part.encryption_info, decrypted) = (
+                crypto_cls().decrypt(
+                    payload.as_string(), require_MDC=require_MDC))
         except (IOError, OSError, ValueError, IndexError, KeyError):
             part.encryption_info = EncryptionInfo()
             part.encryption_info["status"] = "error"
@@ -201,11 +227,34 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
         part.encryption_info.bubble_up(pei)
 
         if part.encryption_info['status'] == 'decrypted':
-            newpart = email.parser.Parser().parse(
-                StringIO.StringIO(decrypted))
+            newpart = email.parser.Parser().parsestr(decrypted)
 
             # Reparent the contents up, removing the encryption wrapper
-            MimeReplacePart(part, newpart)
+            hdrs = MimeReplacePart(part, newpart,
+                                   keep_old_headers='MH-Renamed')
+
+            # Is there a Memory-Hole force-display part?
+            pl = part.get_payload()
+            if hdrs and isinstance(pl, (list, )):
+                if (pl[0]['content-type'].startswith('text/rfc822-headers;')
+                        and 'protected-headers' in pl[0]['content-type']):
+                    # Parse these headers as well and override the top level,
+                    # again. This is to be sure we see the same thing as
+                    # everyone else (same algo as enigmail).
+                    data = email.parser.Parser().parsestr(
+                        pl[0].get_payload(), headersonly=True)
+                    for h in data.keys():
+                        if h in part:
+                            del part[h]
+                        part[h] = data[h]
+                        hdrs.add(h)
+
+                    # Finally just delete the part, we're done with it!
+                    del pl[0]
+
+            part.encrypted_headers = hdrs
+            if part.signature_info["status"] != 'none':
+                part.signed_headers = hdrs
 
             # Try again, in case we just unwrapped another layer
             # of multipart/something.
@@ -214,6 +263,8 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
                              psi=part.signature_info,
                              pei=part.encryption_info,
                              charsets=charsets,
+                             unwrap_attachments=unwrap_attachments,
+                             require_MDC=require_MDC,
                              depth = depth + 1 )
 
     # If we are still multipart after the above shenanigans (perhaps due
@@ -225,25 +276,29 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
                              psi=part.signature_info,
                              pei=part.encryption_info,
                              charsets=charsets,
+                             unwrap_attachments=unwrap_attachments,
+                             require_MDC=require_MDC,
                              depth = depth + 1 )
 
     elif disposition.startswith('attachment'):
         # The sender can attach signed/encrypted/key files without following
         # rules for naming or mime type.
         # So - sniff to detect parts that need processing and identify protocol.
+        kind = ''
         for protocol in protocols:
             crypto_cls = protocols[protocol]
             kind = crypto_cls().sniff(part.get_payload(), encoding)
             if kind:
                 break
 
-        if 'encrypted' in kind or 'signature' in kind:
+        if unwrap_attachments and ('encrypted' in kind or 'signature' in kind):
             # Messy! The PGP decrypt operation is also needed for files which
             # are encrypted and signed, and files that are signed only.
             payload = part.get_payload( None, True )
             try:
-                (part.signature_info, part.encryption_info, decrypted
-                 ) = crypto_cls().decrypt(payload)
+                (part.signature_info, part.encryption_info, decrypted) = (
+                    crypto_cls().decrypt(
+                        payload, require_MDC=require_MDC))
             except (IOError, OSError, ValueError, IndexError, KeyError):
                 part.encryption_info = EncryptionInfo()
                 part.encryption_info["status"] = "error"
@@ -253,19 +308,14 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
 
             if (part.encryption_info['status'] == 'decrypted' or
                     part.signature_info['status'] == 'verified'):
-                newpart = email.parser.Parser().parse(
-                    StringIO.StringIO(decrypted))
 
-                # Use the original file name if available, otherwise
-                # delete .gpg or .asc extension from attachment file name.
-                if part.encryption_info.filename:
-                    disposition = MimeReplaceFilename(disposition,
-                                        part.encryption_info.filename)
-                elif 'armored' in kind:
-                    disposition = MimeTrimFilename(disposition, 'asc')
-                else:
-                    disposition = MimeTrimFilename(disposition, 'gpg')
-                newpart.add_header('content-disposition', disposition)
+                # Force base64 encoding and application/octet-stream type
+                newpart = MIMEBase('application', 'octet-stream')
+                newpart.set_payload(decrypted)
+                encoders.encode_base64(newpart)
+
+                # Add Content-Disposition with appropriate filename.
+                MimeAttachmentDisposition(part, kind, newpart)
 
                 MimeReplacePart(part, newpart)
 
@@ -275,6 +325,8 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
                                  psi=part.signature_info,
                                  pei=part.encryption_info,
                                  charsets=charsets,
+                                 unwrap_attachments=unwrap_attachments,
+                                 require_MDC=require_MDC,
                                  depth = depth + 1 )
             else:
                 # FIXME: Best action for unsuccessful attachment processing?
@@ -286,6 +338,7 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
                                      psi=psi,
                                      pei=pei,
                                      charsets=charsets,
+                                     require_MDC=require_MDC,
                                      depth = depth + 1 )
 
     else:
@@ -304,7 +357,7 @@ def UnwrapMimeCrypto(part, protocols=None, psi=None, pei=None, charsets=None, de
 
 
 def UnwrapPlainTextCrypto(part, protocols=None, psi=None, pei=None,
-                                charsets=None, depth = 0 ):
+                                charsets=None, require_MDC=True, depth=0):
     """
     This method will replace encrypted and signed parts with their
     contents and set part attributes describing the security properties
@@ -319,7 +372,7 @@ def UnwrapPlainTextCrypto(part, protocols=None, psi=None, pei=None,
         if (payload.startswith(crypto.ARMOR_BEGIN_ENCRYPTED) and
                 payload.endswith(crypto.ARMOR_END_ENCRYPTED)):
             try:
-                si, ei, text = crypto.decrypt(payload)
+                si, ei, text = crypto.decrypt(payload, require_MDC=require_MDC)
                 _update_text_payload(part, text, charsets=charsets)
             except (IOError, OSError, ValueError, IndexError, KeyError):
                 ei = EncryptionInfo()
@@ -343,22 +396,117 @@ def UnwrapPlainTextCrypto(part, protocols=None, psi=None, pei=None,
     part.encryption_info.bubble_up(pei)
 
 
+##[ Methods for stripping down message headers ]###############################
+
+
+def ObscureSubject(subject):
+    """
+    Replace the Subject line with something nondescript.
+    """
+    return '(%s)' % _("Subject unavailable")
+
+
+def ObscureNames(hdr):
+    """
+    Remove names (leaving e-mail addresses) from the To: and Cc: headers.
+
+    >>> ObscureNames("Bjarni R. E. <bre@klaki.net>, e@b.c (Elmer Boop)")
+    u'<bre@klaki.net>, <e@b.c>'
+
+    """
+    from mailpile.mailutils.addresses import AddressHeaderParser
+    return ', '.join('<%s>' % ai.address for ai in AddressHeaderParser(hdr))
+
+
+def ObscureSender(sender):
+    """
+    Remove as much metadata from the From: line as possible.
+    """
+    return ObscureNames(sender)
+
+
+def ObscureAllRecipients(sender):
+    """
+    Remove all content from the To: and Cc: lines entirely.
+    """
+    return "recipients-suppressed;"
+
+
+# A dictionary for use with MimeWrapper's obscured_headers parameter,
+# that will obscure as much of the metadata from the public header as
+# possible without breaking compatibility.
+OBSCURE_HEADERS_MILD = {
+    'subject': ObscureSubject,
+    'from': ObscureSender,
+    'sender': ObscureSender,
+    'reply-to': ObscureSender,
+    'to': ObscureNames,
+    'cc': ObscureNames,
+    'user-agent': lambda t: None}
+
+
+# A dictionary for use with MimeWrapper's obscured_headers parameter,
+# that will obscure as much of the metadata from the public header as
+# possible. This is only useful with encrypted messages and will badly
+# break things unless the recipient is running an MUA that fully implements
+# Memory Hole.
+OBSCURE_HEADERS_EXTREME = {
+    'subject': ObscureSubject,
+    'from': ObscureSender,
+    'sender': ObscureSender,
+    'reply-to': ObscureSender,
+    'to': ObscureAllRecipients,
+    'cc': lambda t: None,
+    'date': lambda t: None,
+    'in-reply-to': lambda t: None,
+    'references': lambda t: None,
+    'openpgp': lambda t: None,
+    'user-agent': lambda t: None}
+
+
 ##[ Methods for encrypting and signing ]#######################################
 
 class MimeWrapper:
     CONTAINER_TYPE = 'multipart/mixed'
     CONTAINER_PARAMS = ()
 
+    # These are the default "memory hole" settings; wrap/protect the
+    # important user-visible headers.
+    WRAPPED_HEADERS = ('subject', 'from', 'to', 'cc', 'date', 'user-agent',
+                       'sender', 'reply-to', 'in-reply-to', 'references',
+                       'openpgp', 'autocrypt')
+
+    # Force-displayed headers; if these headers get obscured, add a
+    # visible part that shows them to the user in legacy clients.
+    FORCE_DISPLAY_HEADERS = ('subject', 'from', 'to', 'cc')
+
+    # By default, no headers are obscured. That's a user preference,
+    # since there's a trade-off between privacy and compatibility.
+    OBSCURED_HEADERS = {}
+
     def __init__(self, config,
                  event=None, cleaner=None,
-                 sender=None, recipients=None):
-        from mailpile.mailutils import MakeBoundary
+                 sender=None, recipients=None,
+                 use_html_wrapper=False,
+                 wrapped_headers=None,
+                 obscured_headers=None):
+        from mailpile.mailutils.emails import MakeBoundary
         self.config = config
         self.event = event
         self.sender = sender
         self.cleaner = cleaner
         self.recipients = recipients or []
+        self.use_html_wrapper = use_html_wrapper
         self.container = c = MIMEMultipart(boundary=MakeBoundary())
+
+        self.wrapped_headers = self.WRAPPED_HEADERS
+        if wrapped_headers is not None:
+            self.wrapped_headers = wrapped_headers or ()
+
+        self.obscured_headers = self.OBSCURED_HEADERS
+        if obscured_headers is not None:
+            self.obscured_headers = obscured_headers or {}
+
         c.set_type(self.CONTAINER_TYPE)
         c.signature_info = SignatureInfo(bubbly=False)
         c.encryption_info = EncryptionInfo(bubbly=False)
@@ -408,18 +556,79 @@ class MimeWrapper:
                 only_text_part = part
         return only_text_part
 
-    def wrap(self, msg):
+    def wrap(self, msg, **kwargs):
+        # Subclasses override
+        return msg
+
+    def prepare_wrap(self, msg):
+        obscured = self.obscured_headers
+        wrapped = self.wrapped_headers
+        oo = {}
+
+        # FIXME: Pretty sure this doesn't do the right thing if there
+        #        are multiple headers with the same name.
+
         for h in msg.keys():
             hl = h.lower()
+
             if not hl.startswith('content-') and not hl.startswith('mime-'):
-                self.container[h] = msg[h]
-                del msg[h]
+                if hl in obscured:
+                    oh = obscured[hl](msg[h])
+                    oo[h] = msg[h]
+                    if oh:
+                        self.container[h] = oh
+                else:
+                    self.container[h] = msg[h]
+                if hl not in wrapped and hl not in obscured:
+                    del msg[h]
             elif hl == 'mime-version':
                 del msg[h]
+
         if hasattr(msg, 'signature_info'):
             self.container.signature_info = msg.signature_info
             self.container.encryption_info = msg.encryption_info
-        return self.container
+
+        return self.force_display_headers(msg, oo)
+
+    def force_display_headers(self, msg, headers):
+        if not [k for k in headers.keys()
+                if k.lower() in self.FORCE_DISPLAY_HEADERS]:
+            return msg
+
+        header_display = MIMEBase('text', 'rfc822-headers',
+                                  protected_headers="v1")
+        header_display['Content-Disposition'] = 'inline'
+
+        container = MIMEBase('multipart', 'mixed')
+        container.attach(header_display)
+        container.attach(msg)
+
+        # Cleanup...
+        for p in (msg, header_display, container):
+            if 'MIME-Version' in p:
+                del p['MIME-Version']
+        if self.cleaner:
+            self.cleaner(header_display)
+            self.cleaner(msg)
+
+        # FIXME: Pretty sure this doesn't do the right thing if there
+        #        are multiple headers with the same name.
+        #
+        # NOTE: The copying happens at the end here, because we need the
+        #       cleaner (on msg) to have run first.
+        #
+        display_headers = []
+        for h in msg.keys():
+            hl = h.lower()
+            if not hl.startswith('content-') and not hl.startswith('mime-'):
+                container[h] = msg[h]
+                if hl in self.FORCE_DISPLAY_HEADERS and h in headers:
+                    display_headers.append('%s: %s' % (h, msg[h]))
+                del msg[h]
+
+        header_display.set_payload('\r\n'.join(reversed(display_headers)))
+
+        return container
 
 
 class MimeSigningWrapper(MimeWrapper):
@@ -431,12 +640,35 @@ class MimeSigningWrapper(MimeWrapper):
     def __init__(self, *args, **kwargs):
         MimeWrapper.__init__(self, *args, **kwargs)
 
+        name = 'signature.html' if self.use_html_wrapper else 'signature.asc'
         self.sigblock = MIMEBase(*self.SIGNATURE_TYPE.split('/'))
-        self.sigblock.set_param("name", "signature.asc")
+        self.sigblock.set_param("name", name)
         for h, v in (("Content-Description", self.SIGNATURE_DESC),
                      ("Content-Disposition",
-                      "attachment; filename=\"signature.asc\"")):
+                      "attachment; filename=\"%s\"" % name)):
             self.sigblock.add_header(h, v)
+
+    def _wrap_sig_in_html(self, sig):
+        return (
+            "<html><body><h1>%(title)s</h1><p>\n\n%(description)s\n\n</p>"
+            "<pre>\n%(sig)s\n</pre><hr>"
+            "<i><a href='%(ad_url)s'>%(ad)s</a>.</i></body></html>"
+            ) % self._wrap_sig_in_html_vars(sig)
+
+    def _wrap_sig_in_html_vars(self, sig):
+        return {
+            # FIXME: We deliberately do not flag these messages for i18n
+            #        translation, since we rely on 7-bit content here so as
+            #        not to complicate the MIME structure of the message.
+            "title": "Digital Signature",
+            "description": (
+                "This is a digital signature, which can be used to verify\n"
+                "the authenticity of this message. You can safely discard\n"
+                "or ignore this file if your e-mail software does not\n"
+                "support digital signatures."),
+            "ad": "Generated by Mailpile",
+            "ad_url": "https://www.mailpile.is/",  # FIXME: Link to help?
+            "sig": sig}
 
     def _update_crypto_status(self, part):
         part.signature_info.part_status = 'verified'
@@ -446,6 +678,8 @@ class MimeSigningWrapper(MimeWrapper):
 
         if prefer_inline:
             prefer_inline = self.get_only_text_part(msg)
+        else:
+            prefer_inline = False
 
         if prefer_inline is not False:
             message_text = Normalize(prefer_inline.get_payload(None, True)
@@ -460,13 +694,15 @@ class MimeSigningWrapper(MimeWrapper):
                 return msg
 
         else:
-            MimeWrapper.wrap(self, msg)
+            msg = self.prepare_wrap(msg)
             self.attach(msg)
             self.attach(self.sigblock)
             message_text = self.flatten(msg)
             status, sig = self.crypto().sign(message_text,
                                              fromkey=from_key, armor=True)
             if status == 0:
+                if self.use_html_wrapper:
+                    sig = self._wrap_sig_in_html(sig)
                 self.sigblock.set_payload(sig)
                 self._update_crypto_status(self.container)
                 return self.container
@@ -508,6 +744,8 @@ class MimeEncryptingWrapper(MimeWrapper):
 
         if prefer_inline:
             prefer_inline = self.get_only_text_part(msg)
+        else:
+            prefer_inline = False
 
         if prefer_inline is not False:
             message_text = Normalize(prefer_inline.get_payload(None, True))
@@ -520,10 +758,10 @@ class MimeEncryptingWrapper(MimeWrapper):
                 return msg
 
         else:
-            MimeWrapper.wrap(self, msg)
-            del msg['MIME-Version']
+            msg = self.prepare_wrap(msg)
             if self.cleaner:
                 self.cleaner(msg)
+
             message_text = self.flatten(msg)
             status, enc = self._encrypt(message_text,
                                         tokeys=to_keys,
@@ -534,69 +772,16 @@ class MimeEncryptingWrapper(MimeWrapper):
                 return self.container
 
         raise EncryptionFailureError(_('Failed to encrypt message!'), to_keys)
-      
-class MimeSignEncryptingWrapper(MimeWrapper):
-    CONTAINER_TYPE = 'multipart/encrypted'
-    CONTAINER_PARAMS = ()
-    ENCRYPTION_TYPE = 'application/x-encrypted'
-    ENCRYPTION_VERSION = 0
 
-    def __init__(self, *args, **kwargs):
-        MimeWrapper.__init__(self, *args, **kwargs)
 
-        self.version = MIMEBase(*self.ENCRYPTION_TYPE.split('/'))
-        self.version.set_payload('Version: %s\n' % self.ENCRYPTION_VERSION)
-        for h, v in (("Content-Disposition", "attachment"), ):
-            self.version.add_header(h, v)
+if __name__ == "__main__":
+    import sys
+    import doctest
 
-        self.enc_data = MIMEBase('application', 'octet-stream')
-        for h, v in (("Content-Disposition",
-                      "attachment; filename=\"msg.asc\""), ):
-            self.enc_data.add_header(h, v)
+    # FIXME: Add tests for the wrapping/unwrapping code. It's crazy that
+    #        we don't have such tests. :-(
 
-        self.attach(self.version)
-        self.attach(self.enc_data)
-
-    def _encrypt(self, message_text, tokeys=None, armor=False):
-        from_key = self.get_keys([self.sender])[0]
-        return self.crypto().encrypt(message_text,
-                                     tokeys=tokeys, armor=True,
-                                     sign=True, fromkey=from_key)
-
-    def _update_crypto_status(self, part):
-        part.signature_info.part_status = 'verified'
-        part.encryption_info.part_status = 'decrypted'
-
-    def wrap(self, msg, prefer_inline=False):
-        to_keys = set(self.get_keys(self.recipients + [self.sender]))
-        from_key = self.get_keys([self.sender])[0]
-
-        if prefer_inline:
-            prefer_inline = self.get_only_text_part(msg)
-
-        if prefer_inline is not False:
-            message_text = Normalize(prefer_inline.get_payload(None, True))
-            status, enc = self._encrypt(message_text,
-                                        tokeys=to_keys,
-                                        armor=True)
-            if status == 0:
-                _update_text_payload(prefer_inline, enc)
-                self._update_crypto_status(prefer_inline)
-                return msg
-
-        else:
-            MimeWrapper.wrap(self, msg)
-            del msg['MIME-Version']
-            if self.cleaner:
-                self.cleaner(msg)
-            message_text = self.flatten(msg)
-            status, enc = self._encrypt(message_text,
-                                        tokeys=to_keys,
-                                        armor=True)
-            if status == 0:
-                self.enc_data.set_payload(enc)
-                self._update_crypto_status(self.enc_data)
-                return self.container
-	#We raise a signing error rather than encrypting error so that the mailpile interface
-	#Opens dialog to unlock key. (Error most probably comes from a key locked)
-        raise SignatureFailureError(_('Failed to sign message!'), from_key)
+    results = doctest.testmod(optionflags=doctest.ELLIPSIS)
+    print '%s' % (results, )
+    if results.failed:
+        sys.exit(1)

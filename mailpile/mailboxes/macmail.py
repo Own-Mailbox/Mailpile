@@ -66,9 +66,11 @@ class MacMaildir(mailbox.Mailbox):
 
     def remove(self, key):
         """Remove the message or raise error if nonexistent."""
-        raise NotImplemented("Mailpile is readonly, for now.")
-        # FIXME: Hmm?
-        #safe_remove(os.path.join(self._mailroot, self._lookup(key)))
+        safe_remove(os.path.join(self._mailroot, self._lookup(key)))
+        try:
+            del self._toc[key]
+        except:
+            pass
 
     def discard(self, key):
         """If the message exists, remove it."""
@@ -149,6 +151,12 @@ class MailpileMailbox(UnorderedPicklable(MacMaildir)):
                 and os.path.exists(os.path.join(fn, 'Info.plist'))):
             return (fn, )
         raise ValueError('Not a Mac Mail.app Maildir: %s' % fn)
+
+    def __unicode__(self):
+        return _("Mac Maildir %s") % self._mailroot
+
+    def _describe_msg_by_ptr(self, msg_ptr):
+        return _("e-mail in file %s") % self._lookup(msg_ptr[MBX_ID_LEN:])
 
 
 mailpile.mailboxes.register(50, MailpileMailbox)

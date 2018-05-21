@@ -8,7 +8,7 @@ from mailpile.plugins import PluginManager
 from mailpile.plugins.keylookup import LookupHandler
 from mailpile.plugins.keylookup import register_crypto_key_lookup_handler
 from mailpile.plugins.search import Search
-from mailpile.mailutils import Email
+from mailpile.mailutils.emails import Email
 
 import pgpdump
 
@@ -112,13 +112,15 @@ class EmailKeyLookupHandler(LookupHandler, Search):
         session, idx = self._do_search(search=terms)
         deadline = time.time() + (0.75 * self.TIMEOUT)
         for messageid in session.results[:5]:
-            for key_data in self._get_keys(messageid):
+            for key_info, raw_key in self._get_message_keys(messageid):
                 if strict_email_match:
-                    match = [u for u in key_data.get('uids', [])
+                    match = [u for u in key_info.get('uids', [])
                              if (u['email'] or '').lower() == address]
                     if not match:
                         continue
-                results[key_data["fingerprint"]] = copy.copy(key_data)
+                fp = key_info["fingerprint"]
+                results[fp] = copy.copy(key_info)
+                self.key_cache[fp] = raw_key
             if len(results) > 5 or time.time() > deadline:
                 break
         return results
@@ -130,7 +132,7 @@ class EmailKeyLookupHandler(LookupHandler, Search):
         else:
             raise ValueError("Key not found")
 
-    def _get_keys(self, messageid):
+    def _get_message_keys(self, messageid):
         keys = self.key_cache.get(messageid, [])
         if not keys:
             email = Email(self._idx(), messageid)
@@ -140,8 +142,7 @@ class EmailKeyLookupHandler(LookupHandler, Search):
                 if _might_be_pgp_key(part["filename"], part["mimetype"]):
                     key = part["part"].get_payload(None, True)
                     for keydata in _get_keydata(key):
-                        keys.append(keydata)
-                        self.key_cache[keydata["fingerprint"]] = key
+                        keys.append((keydata, key))
                     if len(keys) > 5:  # Just to set some limit...
                         break
             self.key_cache[messageid] = keys
@@ -161,9 +162,9 @@ def has_pgpkey_data_kw_extractor(index, msg, mimetype, filename, part, loader,
             body_info['pgp_key'] = filename
             kws += ['pgpkey:has']
 
-    # FIXME: If this part is a signature, record which signatures we've
-    #        seen from which keys, for historic profiling purposes. Keys
-    #        used more often are less likely to be forgeries.
+    # FIXME: If this is a PGP key, make all the key IDs searchable so
+    #        we can find this file again later! Searching by e-mail is lame.
+    #        This is issue #655 ?
 
     return kws
 

@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import traceback
+import thread
 import threading
 import time
 import webbrowser
@@ -19,6 +20,7 @@ import webbrowser
 import mailpile.util
 import mailpile.postinglist
 import mailpile.security as security
+import mailpile.platforms
 from mailpile.commands import *
 from mailpile.config.validators import WebRootCheck
 from mailpile.crypto.gpgi import GnuPG
@@ -26,7 +28,7 @@ from mailpile.eventlog import Event
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
 from mailpile.mailboxes import IsMailbox
-from mailpile.mailutils import ClearParseCache, Email
+from mailpile.mailutils.emails import ClearParseCache, Email
 from mailpile.postinglist import GlobalPostingList
 from mailpile.plugins import PluginManager
 from mailpile.safe_popen import MakePopenUnsafe, MakePopenSafe
@@ -76,6 +78,12 @@ class Rescan(Command):
         args = list(self.args)
         if 'which' in self.data:
             args.extend(self.data['which'])
+
+        # Abort if we are out of disk space
+        full_path = config.need_more_disk_space()
+        if full_path:
+            return self._error(_('Insufficient free space in %s'
+                                 ) % full_path)
 
         # Pretend we're idle, to make rescan go fast fast.
         if not slowly:
@@ -337,15 +345,24 @@ class Optimize(Command):
 
 class DeleteMessages(Command):
     """Delete one or more messages."""
-    SYNOPSIS = (None, 'delete', 'message/delete', '<messages>')
+    SYNOPSIS = (None, 'delete', 'message/delete', '[--keep] <messages>')
     ORDER = ('Searching', 99)
+    IS_USER_ACTIVITY = True
 
     def command(self, slowly=False):
         idx = self._idx()
+
+        args = list(self.args)
+        keep = 0
+        while '--keep' in args:
+            args.remove('--keep')
+            keep += 1
+
         deleted, failed, mailboxes = [], [], []
-        for msg_idx in self._choose_messages(self.args):
+        for msg_idx in self._choose_messages(args):
             e = Email(idx, msg_idx)
-            del_ok, mboxes = e.delete_message(self.session, flush=False)
+            del_ok, mboxes = e.delete_message(self.session,
+                                              flush=False, keep=keep)
             mailboxes.extend(mboxes)
             if del_ok:
                 deleted.append(msg_idx)
@@ -353,8 +370,9 @@ class DeleteMessages(Command):
                 failed.append(msg_idx)
 
         # This will actually delete from mboxes, etc.
-        for m in mailboxes:
-            m.flush()
+        for m in set(mailboxes):
+            with m:
+                m.flush()
 
         # FIXME: Trigger a background rescan of affected mailboxes, as
         #        the flush() above may have broken our pointers.
@@ -401,7 +419,7 @@ class BrowseOrLaunch(Command):
         try:
             socket.create_connection(sspec[:2])
             self.Browse(sspec)
-            os._exit(1)
+            os._exit(127)
         except IOError:
             pass
 
@@ -450,6 +468,36 @@ class RunWWW(Command):
             return self._error(_('Failed to start the web server'))
 
 
+class Cleanup(Command):
+    """Perform cleanup actions (runs before shutdown)"""
+    SYNOPSIS = (None, 'cleanup', None, "")
+    ORDER = ('Internals', 5)
+    CONFIG_REQUIRED = False
+    SPLIT_ARG = False
+    TASKS = []
+
+    @classmethod
+    def AddTask(cls, task, last=False, first=False):
+        safe_assert(not (first and last))
+        if (first or last) and not cls.TASKS:
+            cls.TASKS = [lambda: True]
+        if first:
+            cls.TASKS.insert(0, task)
+        elif last:
+            cls.TASKS.append(task)
+        else:
+            cls.TASKS.insert(len(cls.TASKS) - 1, task)
+
+    def command(self):
+        while self.TASKS:
+            try:
+                self.TASKS.pop(0)()
+            except:
+                traceback.print_exc()
+                pass
+        return self._success(_('Performed shutdown tasks'))
+
+
 class WritePID(Command):
     """Write the PID to a file"""
     SYNOPSIS = (None, 'pidfile', None, "</path/to/pidfile>")
@@ -458,8 +506,10 @@ class WritePID(Command):
     SPLIT_ARG = False
 
     def command(self):
-        with vfs.open(self.args[0], 'w') as fd:
+        filename = self.args[0]
+        with vfs.open(filename, 'w') as fd:
             fd.write('%d' % os.getpid())
+            Cleanup.AddTask(lambda: os.unlink(filename), last=True)
         return self._success(_('Wrote PID to %s') % self.args)
 
 
@@ -628,7 +678,7 @@ class ProgramStatus(Command):
 class CronStatus(Command):
     """Manually edit or display the background job schedule"""
     SYNOPSIS = (None, 'cron', None,
-                "[<job> <--interval <n>|--trigger>]")
+                "[<job> <--trigger|--interval <n>|--postpone <hours>>]")
     ORDER = ('Internals', 4)
     IS_USER_ACTIVITY = False
 
@@ -672,6 +722,9 @@ class CronStatus(Command):
             elif op == 'trigger':
                 interval = config.cron_worker.schedule[job][1]
                 config.cron_worker.schedule[job][3] = now - interval
+            elif op == 'postpone':
+                hours = float(args.pop(0))
+                config.cron_worker.schedule[job][3] += int(hours * 3600)
             else:
                 raise NotImplementedError('Unknown op: %s' % op)
 
@@ -682,6 +735,84 @@ class CronStatus(Command):
                 'jobs': config.cron_worker.schedule.values()})
 
 
+class HealthCheck(Command):
+    """Check and report app health"""
+    SYNOPSIS = (None, 'health', None, "")
+    ORDER = ('Internals', 4)
+    CONFIG_REQUIRED = False
+    IS_USER_ACTIVITY = False
+
+    # We cache our health event, so it can be updated by the class methods.
+    health_event = None
+
+    def _create_event(self):
+        if HealthCheck.health_event is not None:
+            self.event = HealthCheck.health_event
+        else:
+            Command._create_event(self)
+            self.event.data['starttime'] = int(time.time())
+            self.event.data['problems'] = {}
+            self.event.data['healthy'] = True
+            HealthCheck.health_event = self.event
+
+    @classmethod
+    def _disk_check(cls, session, config):
+        if config.need_more_disk_space():
+            return _('Insufficient free disk space') + '.'
+        return False
+
+    @classmethod
+    def _readonly_check(cls, session, config):
+        from mailpile.security import _lockdown_basic
+        if _lockdown_basic(config):
+            return _('Your Mailpile is read-only!')
+        return False
+
+    @classmethod
+    def check(cls, session, config):
+        # Check all the things! The order here matters, more critical things
+        # should be reported last as they will determine the final message.
+        if not cls.health_event:
+            return False
+
+        messages = []
+        problems = cls.health_event.data['problems']
+
+        was_healthy = cls.health_event.data['healthy']
+        old_problems = ' '.join(sorted(problems.keys()))
+
+        now_healthy = True
+        for crit, name, check in ((True, 'disk', cls._disk_check),
+                                  (True, 'readonly', cls._readonly_check)):
+             message = check(session, config)
+             if message:
+                 problems[name] = message
+                 messages.append(message)
+                 if crit:
+                     now_healthy = False
+             elif name in problems:
+                 del problems[name]
+
+        cls.health_event.data['healthy'] = now_healthy
+        if messages:
+            cls.health_event.message = ' '.join(messages[-2:])
+            cls.health_event.flags = cls.health_event.RUNNING
+        else:
+            cls.health_event.message = _('We are healthy!')
+            cls.health_event.flags = cls.health_event.COMPLETE
+
+        # Only record changes to the event log
+        new_problems = ' '.join(sorted(problems.keys()))
+        if old_problems != new_problems and config.event_log:
+            config.event_log.log_event(cls.health_event)
+
+        return True
+
+    def command(self, args=None):
+        self.check(self.session, self.session.config)
+        return self._success(self.event.message, result=self.event)
+
+
 class GpgCommand(Command):
     """Interact with GPG directly"""
     SYNOPSIS = (None, 'gpg', None, "<GPG arguments ...>")
@@ -690,19 +821,29 @@ class GpgCommand(Command):
 
     class CommandResult(Command.CommandResult):
         def as_text(self):
+            if self.result:
+                return '%s\n\n%s' % (
+                    (self.result['stdout'] or _('(no output)')).strip(),
+                    self.message)
             return '%s' % self.message
 
     def command(self, args=None):
         args = list((args is None) and self.args or args or [])
-
-        # FIXME: For this to work anywhere but in a terminal, we'll need
-        #        to somehow pipe input to/from GPG in a more sane way.
-
         binary, rv = self._gnupg().gpgbinary, '(unknown)'
         with self.session.ui.term:
             try:
                 self.session.ui.block()
-                rv = os.system(' '.join([binary] + args))
+                if (self.session.ui.interactive and
+                        self.session.ui.render_mode == 'text'):
+                    rv = os.system(' '.join([binary] + args))
+                    stdout = None
+                else:
+                    sp = subprocess.Popen(
+                        [binary] + ['--batch', '--no-tty'] + args,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        stdin=subprocess.PIPE)
+                    (stdout, stderr) = sp.communicate(input='')
+                    rv = sp.wait()
                 from mailpile.plugins.vcard_gnupg import PGPKeysImportAsVCards
                 PGPKeysImportAsVCards(self.session).run()
             except:
@@ -710,7 +851,9 @@ class GpgCommand(Command):
 
         return self._success(_("That was fun!") + ' ' +
                              _("%s returned: %s") % (binary, rv),
-                             result={'binary': binary, 'returned': rv})
+                             result={'binary': binary,
+                                     'stdout': stdout,
+                                     'returned': rv})
 
 
 class ListDir(Command):
@@ -873,6 +1016,7 @@ class CatFile(Command):
                     self.session.ui.error('Decrypt failed at %d' % where)
                 decrypt_and_parse_lines(fd, cb, self.session.config,
                                         newlines=True, decode=None,
+                                        gpgi=self._gnupg(),
                                         _raise=False, error_cb=errors)
 
         if tfd:
@@ -885,6 +1029,22 @@ class CatFile(Command):
 
 
 ##[ Configuration commands ]###################################################
+
+
+class ListLanguages(Command):
+    """List available languages"""
+    SYNOPSIS = (None, 'languages', 'settings/languages', '')
+    ORDER = ('Config', 1)
+    CONFIG_REQUIRED = False
+    IS_USER_ACTIVITY = False
+    HTTP_CALLABLE = ('GET', )
+
+    def command(self):
+        from mailpile.i18n import ListTranslations
+        langs = ListTranslations(self.session.config)
+        return self._success(_('Listed available translations'),
+                             result=sorted([(l, langs[l]) for l in langs]))
+
 
 class ConfigSet(Command):
     """Change a setting"""
@@ -978,7 +1138,15 @@ class ConfigSet(Command):
                         raise ValueError('Need --force to change auth policy.')
 
                 value = value.strip()
-                if value[:1] in ('{', '[') and value[-1:] in ( ']', '}'):
+                if value == '{None}':
+                    value = None
+                elif value == '{Blank}':
+                    value = ''
+                elif value == '{False}':
+                    value = False
+                elif value == '{True}':
+                    value = True
+                elif value[:1] in ('{', '[') and value[-1:] in ( ']', '}'):
                     value = json.loads(value)
                 try:
                     try:
@@ -1153,7 +1321,8 @@ class ConfigPrint(Command):
                             rv[key] = '{ ..(%s).. }' % rv[key]['host']
                         else:
                             rv[key] = '{ ... }'
-                elif sanitize and key.lower()[:4] in ('pass', 'secr'):
+                elif (sanitize
+                        and key.lower()[:4] in ('pass', 'secr', 'obfu')):
                     rv[key] = '(SUPPRESSED)'
             return rv
         return data
@@ -1231,8 +1400,8 @@ class ConfigureMailboxes(Command):
         'profile': 'Profile/account ID or e-mail',
         'recurse': 'y/n: search subdirectories?',
         'apply_tags': 'Mailbox tags',
+        'guess_tags': 'Guess mailbox tags',
         'auto_index': 'Account e-mail or ID',
-        'tag_visible': 'Make new tags visible in sidebar',
         'local_copy': 'Make local copy of mail'
     }
     COMMAND_SECURITY = security.CC_CHANGE_CONFIG
@@ -1247,7 +1416,6 @@ class ConfigureMailboxes(Command):
 
         session, config = self.session, self.session.config
         paths = list(self.args)
-        recurse = False
 
         # Which tags do we want to apply?
         apply_tags = self.data.get('apply_tags', [])
@@ -1264,12 +1432,12 @@ class ConfigureMailboxes(Command):
 
         if self.data.get('_method', 'CLI') == 'POST':
             auto_index = self._truthy('auto_index', default='n')
-            tag_visible = self._truthy('tag_visible', default='n')
             local_copy = self._truthy('local_copy', default='n')
+            guess_tags = self._truthy('guess_tags', default='n')
         else:
             auto_index = True
-            tag_visible = False
             local_copy = None
+            guess_tags = None
 
         # Recursion or other options requested on CLI?
         if self.data.get('_method', 'CLI') == 'CLI':
@@ -1277,8 +1445,10 @@ class ConfigureMailboxes(Command):
                 recurse = paths.pop(paths.index('--recurse'))
             while paths and '--local_copy' in paths:
                 local_copy = paths.pop(paths.index('--local_copy'))
-            while paths and '--tag_visible' in paths:
-                tag_visible = paths.pop(paths.index('--tag_visible'))
+            while paths and '--guess_tags' in paths:
+                guess_tags = paths.pop(paths.index('--guess_tags'))
+            while paths and '--no_guess_tags' in paths:
+                guess_tags = not paths.pop(paths.index('--guess_tags'))
             while paths and '--no_auto_index' in paths:
                 auto_index = not paths.pop(paths.index('--no_auto_index'))
 
@@ -1292,6 +1462,9 @@ class ConfigureMailboxes(Command):
 
         # Turn raw paths into FilePath objects
         paths = [FilePath(p) for p in paths]
+        # Strip leading slashes of src: paths
+        paths = [FilePath(p.raw_fp[1:]) if p.raw_fp.startswith('/src:') else p
+                 for p in paths]
         opaths = paths[:]
 
         # Get a list of existing mailboxes...
@@ -1313,7 +1486,10 @@ class ConfigureMailboxes(Command):
                 fn_display = fn.display()
                 einfo = existing.get(fn.encoded())
                 if fn.raw_fp.startswith("src:"):
-                    configure.append((fn, einfo))
+                    if einfo:
+                        configure.append((fn, einfo))
+                    else:
+                        adding.append(fn)
                     has_source = True
                 elif einfo:
                     if einfo[2]:
@@ -1322,22 +1498,30 @@ class ConfigureMailboxes(Command):
                     if not account:
                         session.ui.warning('Already in the pile: %s'
                                            % fn_display)
-                elif IsMailbox(fn.raw_fp, config):
-                    adding.append(fn)
-                elif recurse and vfs.exists(fn) and vfs.isdir(fn):
-                    session.ui.mark('Scanning %s for mailboxes' % fn_display)
-                    try:
-                        for f in [f for f in vfs.listdir(fn)
-                                  if not f.raw_fp.startswith('.')]:
-                            paths.append(vfs.path_join(fn, f))
-                            if len(paths) > self.MAX_PATHS:
-                                return self._error(_('Too many files'))
-                    except OSError:
-                        if fn in opaths:
-                            return self._error(_('Failed to read: %s'
-                                                 ) % fn_display)
-                elif fn in opaths:
-                    return self._error(_('Not a mailbox: %s') % fn_display)
+                else:
+                    if IsMailbox(fn.raw_fp, config):
+                        adding.append(fn)
+                        added = True
+                        blacklist = ('.', '..', 'new', 'cur', 'tmp')
+                    else:
+                        added = False
+                        blacklist = ('.', '..')
+
+                    if recurse and vfs.exists(fn) and vfs.isdir(fn):
+                        session.ui.mark('Scanning %s for mailboxes' % fn_display)
+                        try:
+                            for f in [f for f in vfs.listdir(fn)
+                                      if not f.raw_fp in blacklist]:
+                                paths.append(vfs.path_join(fn, f))
+                                if len(paths) > self.MAX_PATHS:
+                                    return self._error(_('Too many files'))
+                        except OSError:
+                            if fn in opaths:
+                                return self._error(_('Failed to read: %s'
+                                                     ) % fn_display)
+                    elif fn in opaths and not added:
+                        return self._error(_('Not a mailbox: %s') % fn_display)
+
         except KeyboardInterrupt:
             return self._error(_('User aborted'))
 
@@ -1345,12 +1529,15 @@ class ConfigureMailboxes(Command):
             local_copy = has_source  # No source; probably already local
 
         if self.data.get('_method', 'CLI') == 'GET':
+            if not apply_tags and len(opaths) == 1:
+                apply_tags = list(config.guess_tags(opaths[0].raw_fp))
             return self._success(_('Add and configure mailboxes'), result={
+                'paths': opaths,
                 'profile': account_id,
                 'apply_tags': apply_tags,
                 'auto_index': auto_index,
-                'tag_visible': tag_visible,
                 'local_copy': local_copy,
+                'recurse': recurse,
                 'has_source': has_source,
                 'adding': adding,
                 'configure': configure
@@ -1364,15 +1551,15 @@ class ConfigureMailboxes(Command):
             for arg in adding:
                 mbox_id = config.sys.mailbox.append(arg)
                 added[mbox_id] = arg
-                if account:
-                    configure.append((arg, (FilePath(arg), mbox_id, None)))
+                if account or arg.raw_fp.startswith('src:'):
+                    configure.append((arg, (arg, mbox_id, None)))
 
             def _get_source(path, einfo):
                 if einfo and einfo[2]:
                     return einfo[2]
-                if (path.raw_fp.startswith('src:') or
-                        path.raw_fp.startswith('/src:')):
-                    src_id = path.raw_fp.split(':')[1].split('/')[0]
+                raw_path = path.raw_fp
+                if raw_path.split(':')[0] == 'src':
+                    src_id = raw_path.split(':')[1].split('/')[0]
                     return config.sources[src_id]
                 return account.get_source_by_proto('local', create=True)
 
@@ -1384,8 +1571,8 @@ class ConfigureMailboxes(Command):
                 source_obj.take_over_mailbox(mbox_id,
                                              policy=policy,
                                              create_local=local_copy,
+                                             guess_tags=guess_tags,
                                              apply_tags=apply_tags,
-                                             visible_tags=tag_visible,
                                              save=False)
                 configured[mbox_id] = path
 
@@ -1495,28 +1682,33 @@ class Pipe(Command):
 
 class Quit(Command):
     """Exit Mailpile, normal shutdown"""
-    SYNOPSIS = ("q", "quit", "quitquitquit", None)
+    SYNOPSIS = ("q", "quit", "quitquitquit", '[restart]')
     ABOUT = ("Quit mailpile")
     ORDER = ("Internals", 2)
     CONFIG_REQUIRED = False
     RAISES = (KeyboardInterrupt,)
+    HTTP_CALLABLE = ('POST',)
+    HTTP_POST_VARS = {
+        'restart': 'Set to restart instead of shutting down'
+    }
     COMMAND_SECURITY = security.CC_QUIT
 
     def command(self):
-        mailpile.util.QUITTING = True
-        self._background_save(index=True, config=True, wait=True)
+        if 'restart' in self.args or self.data.get('restart', [False])[0]:
+            mailpile.util.QUITTING = 'restart'
+        else:
+            mailpile.util.QUITTING = mailpile.util.QUITTING or True
+
+        from mailpile.plugins.gui import UpdateGUIState
+        UpdateGUIState()
+
+        self._background_save(index=True, config='!FORCE', wait=True)
         if self.session.config.http_worker:
             self.session.config.http_worker.quit()
-        try:
-            import signal
-            os.kill(mailpile.util.MAIN_PID, signal.SIGINT)
-        except:
-            def exiter():
-                time.sleep(1)
-                os._exit(0)
-            threading.Thread(target=exiter).start()
 
+        thread.interrupt_main()
         return self._success(_('Shutting down...'))
+
 
 class IdleQuit(Command):
     """Shut down Mailpile if it has been idle for a while"""
@@ -1535,7 +1727,7 @@ class IdleQuit(Command):
         self.started = time.time()
         config.cron_worker.add_task('idlequit', self.timeout / 5, self.check)
         return self._success(
-            _('Will shut down if idle for over %s seconds') % self.timeout,
+            _('Will shutdown if idle for over %s seconds') % self.timeout,
             {'timeout': self.timeout})
 
 
@@ -1565,7 +1757,7 @@ class Abort(Command):
     COMMAND_SECURITY = security.CC_QUIT
 
     def command(self):
-        mailpile.util.QUITTING = True
+        mailpile.util.QUITTING = mailpile.util.QUITTING or True
         if 'no_save' not in self.data:
             self._background_save(index=True, config=True, wait=True,
                                   wait_callback=lambda: os._exit(1))
@@ -1689,7 +1881,7 @@ class Help(Command):
             for cls in COMMANDS:
                 name = cls.SYNOPSIS[1] or cls.SYNOPSIS[2]
                 width = len(name or '')
-                if name and name == command:
+                if name and command in cls.SYNOPSIS[1:3]:
                     order = 1
                     cmd_list = {'_main': (name, cls.SYNOPSIS[3],
                                           cls.__doc__, order)}
@@ -1723,7 +1915,7 @@ class Help(Command):
                                                        cls.__doc__,
                                                        count + cls.ORDER[1])
             if config.loaded_config:
-                tags = GetCommand('tags')(self.session).run()
+                tags = GetCommand('tags')(self.session).run(display="priority")
             else:
                 tags = {}
             try:
@@ -1797,7 +1989,7 @@ class HelpSplash(Help):
         in_browser = False
         if http_worker:
             http_url = 'http://%s:%s%s/' % http_worker.httpd.sspec
-            if ((sys.platform[:3] in ('dar', 'win') or os.getenv('DISPLAY'))
+            if (mailpile.platforms.InDesktopEnvironment()
                     and self.session.config.prefs.open_in_browser):
                 if BrowseOrLaunch.Browse(http_worker.httpd.sspec):
                     in_browser = True
@@ -1818,9 +2010,9 @@ class HelpSplash(Help):
 
 _plugins.register_commands(
     Load, Optimize, Rescan, DeleteMessages,
-    BrowseOrLaunch, RunWWW, ProgramStatus, CronStatus,
-    GpgCommand, ListDir, ChangeDir, CatFile, WritePID,
+    BrowseOrLaunch, RunWWW, ProgramStatus, CronStatus, HealthCheck,
+    GpgCommand, ListDir, ChangeDir, CatFile, WritePID, Cleanup,
     ConfigPrint, ConfigSet, ConfigAdd, ConfigUnset, ConfigureMailboxes,
-    RenderPage, Output, Pipe,
+    ListLanguages, RenderPage, Output, Pipe,
     Help, HelpVars, HelpSplash, Quit, IdleQuit, TrustingQQQ, Abort
 )

@@ -21,10 +21,10 @@ from mailpile.plugins.contacts import AddProfile, ListProfiles
 from mailpile.plugins.contacts import ListProfiles
 from mailpile.plugins.migrate import Migrate
 from mailpile.plugins.motd import MOTD_URL_TOR_ONLY_NO_MARS
+from mailpile.plugins.setup_magic_ispdb import STATIC_ISPDB
 from mailpile.plugins.tags import AddTag
 from mailpile.commands import Command
-from mailpile.crypto.gpgi import GnuPG, SignatureInfo, EncryptionInfo
-from mailpile.crypto.gpgi import GnuPGKeyGenerator, GnuPGKeyEditor
+from mailpile.crypto.gpgi import SignatureInfo, EncryptionInfo
 from mailpile.eventlog import Event
 from mailpile.httpd import BLOCK_HTTPD_LOCK, Idle_HTTPD
 from mailpile.smtp_client import SendMail, SendMailError
@@ -61,21 +61,26 @@ class SetupMagic(Command):
             'display_order': 2,
             'icon': 'icon-inbox',
             'label_color': '06-blue',
+            'notify_new': True,
             'name': _('Inbox'),
         },
         'Blank': {
             'type': 'blank',
             'flag_editable': True,
             'flag_msg_only': True,
+            'flag_allow_add': False,
             'display': 'invisible',
+            'template': 'outgoing',
             'name': _('Blank'),
         },
         'Drafts': {
             'type': 'drafts',
             'flag_editable': True,
             'flag_msg_only': True,
+            'flag_allow_add': False,
             'display': 'priority',
             'display_order': 1,
+            'template': 'drafts',
             'icon': 'icon-compose',
             'label_color': '03-gray-dark',
             'name': _('Drafts'),
@@ -83,8 +88,10 @@ class SetupMagic(Command):
         'Outbox': {
             'type': 'outbox',
             'flag_msg_only': True,
+            'flag_allow_add': False,
             'display': 'priority',
             'display_order': 3,
+            'template': 'outbox',
             'icon': 'icon-outbox',
             'label_color': '06-blue',
             'name': _('Outbox'),
@@ -94,6 +101,7 @@ class SetupMagic(Command):
             'flag_msg_only': True,
             'display': 'priority',
             'display_order': 4,
+            'template': 'sent',
             'icon': 'icon-sent',
             'label_color': '03-gray-dark',
             'name': _('Sent'),
@@ -128,8 +136,11 @@ class SetupMagic(Command):
             'flag_hides': True,
             'display': 'priority',
             'display_order': 6,
+            'template': 'trash',
             'icon': 'icon-trash',
             'label_color': '13-brown',
+            'auto_after': 91,
+            'auto_action': '!delete',
             'name': _('Trash'),
         },
         # These are magical tags that perform searches and show
@@ -148,6 +159,7 @@ class SetupMagic(Command):
             'icon': 'icon-photos',
             'label': False,
             'label_color': '08-green',
+            'template': 'photos',
             'name': _('Photos'),
             'display_order': 1002,
             '_filters': ['att:jpg is:personal'],
@@ -157,6 +169,7 @@ class SetupMagic(Command):
             'icon': 'icon-document',
             'label': False,
             'label_color': '06-blue',
+            'template': 'atts',
             'name': _('Documents'),
             'display_order': 1003,
             '_filters': ['has:document is:personal'],
@@ -193,6 +206,8 @@ class SetupMagic(Command):
     def basic_app_config(self, session,
                          save_and_update_workers=True,
                          want_daemons=True):
+        session.ui.notify(_('Disabling lockdown'))
+        security.DISABLE_LOCKDOWN = True
         # Create local mailboxes
         session.config.open_local_mailbox(session)
 
@@ -277,15 +292,15 @@ class SetupMagic(Command):
                                  'for super awesome spam filtering'))
 
         vcard_importers = session.config.prefs.vcard.importers
-#        if not vcard_importers.gravatar:
-#            vcard_importers.gravatar.append({'active': True})
-#            session.ui.notify(_('Enabling Gravatar image importer'))
-        #if not vcard_importers.libravatar:
-            #vcard_importers.libravatar.append({'active': True})
-            #session.ui.notify(_('Enabling Libravatar image importer'))
+        if not vcard_importers.gravatar:
+            vcard_importers.gravatar.append({'active': True})
+            session.ui.notify(_('Enabling Gravatar image importer'))
+        if not vcard_importers.libravatar:
+            vcard_importers.libravatar.append({'active': True})
+            session.ui.notify(_('Enabling Libravatar image importer'))
 
         gpg_home = os.path.expanduser('~/.gnupg')
-        if os.path.exists(gpg_home) and not vcard_importers.gpg:
+        if not vcard_importers.gpg:
             vcard_importers.gpg.append({'active': True,
                                         'gpg_home': gpg_home})
             session.ui.notify(_('Importing contacts from GPG keyring'))
@@ -307,12 +322,18 @@ class SetupMagic(Command):
             session.config.save()
             session.config.prepare_workers(session, daemons=want_daemons)
 
+        # Scan GnuPG keychain in background
+        from mailpile.plugins.vcard_gnupg import PGPKeysImportAsVCards
+        session.config.slow_worker.add_unique_task(
+            session, 'initialpgpkeyimport',
+            lambda: PGPKeysImportAsVCards(session).run())
+
         # Enable Tor in the background, if we have it...
         session.config.slow_worker.add_unique_task(
             session, 'tor-autoconfig', lambda: SetupTor.autoconfig(session))
 
-    def setup_command(self, session):
-        pass  # Overridden by children
+        session.ui.notify(_('Reenabling lockdown'))
+        security.DISABLE_LOCKDOWN = False
 
     def make_master_key(self):
         session = self.session
@@ -352,6 +373,22 @@ class SetupMagic(Command):
             return True
         else:
             return False
+
+    @classmethod
+    def URLGet(cls, session, url, data=None):
+        if url.lower().startswith('https'):
+            conn_needs = [ConnBroker.OUTGOING_HTTPS]
+        else:
+            conn_needs = [ConnBroker.OUTGOING_HTTP]
+        session.ui.mark('Getting: %s' % url)
+        with ConnBroker.context(need=conn_needs) as context:
+            return urlopen(url, data=data, timeout=10).read()
+
+    def _urlget(self, url, data=None):
+        return self.URLGet(self.session, url, data=data)
+
+    def setup_command(self, session):
+        pass  # Overridden by children
 
     def command(self, *args, **kwargs):
         return self.setup_command(self.session, *args, **kwargs)
@@ -416,7 +453,8 @@ class TestableWebbable(SetupMagic):
 
 class SetupGetEmailSettings(TestableWebbable):
     """Lookup, guess, test server details for an e-mail address"""
-    SYNOPSIS = (None, 'setup/email_servers', 'setup/email_servers', None)
+    SYNOPSIS = (None, 'setup/email_servers', 'setup/email_servers',
+                "<email> <password>")
     HTTP_CALLABLE = ('GET', )
     HTTP_QUERY_VARS = dict_merge(TestableWebbable.HTTP_QUERY_VARS, {
         'email': 'E-mail address',
@@ -458,15 +496,6 @@ class SetupGetEmailSettings(TestableWebbable):
         else:
             self.session.ui.mark(message)
 
-    def _urlget(self, url):
-        if url.lower().startswith('https'):
-            conn_needs = [ConnBroker.OUTGOING_HTTPS]
-        else:
-            conn_needs = [ConnBroker.OUTGOING_HTTP]
-        with ConnBroker.context(need=conn_needs) as context:
-            self.session.ui.mark('Getting: %s' % url)
-            return urlopen(url, data=None, timeout=10).read()
-
     def _username(self, val, email):
         lpart = email.split('@')[0]
         return str(val).replace('%EMAILADDRESS%', email
@@ -496,12 +525,15 @@ class SetupGetEmailSettings(TestableWebbable):
 
     def _rank(self, entry):
         rank = 0
-        proto = entry.get('protocol', 'unknown')
+        proto = entry.get('protocol', 'unknown').lower()
+        auth = entry.get('auth_type', 'unknown').lower()
         for srch, score in [('pop3', 1),
                             ('imap', 2),
                             ('ssl', 10),
-                            ('tls', 5)]:
-            if srch in proto:
+                            ('tls', 5),
+                            ('oauth2', 10),
+                            ('password', 0)]:
+            if srch in proto or srch in auth:
                 rank -= score
         return rank
 
@@ -518,10 +550,14 @@ class SetupGetEmailSettings(TestableWebbable):
 
         return domain
 
-    def _get_xml_autoconfig(self, url, email):
+    def _get_xml_autoconfig(self, url, domain, email):
         try:
             result = {'sources': [], 'routes': []}
-            xml_data = self._urlget(url)
+
+            xml_data = STATIC_ISPDB.get(domain)
+            if not xml_data:
+                xml_data = self._urlget(url)
+
             if xml_data:
                 data = objectify.fromstring(xml_data)
 # FIXME: Massage these so they match the format of the routes and
@@ -542,33 +578,30 @@ class SetupGetEmailSettings(TestableWebbable):
                         result['docs'] = result.get('docs', [])
                         result['docs'].append({
                             'url': docs.get('url', ''),
-                            'description': str(docs.descr)
+                            'description': docs.descr.text
                         })
                 except AttributeError:
                     pass
                 for insrv in data.emailProvider.incomingServer:
-                    result['sources'].append({
-                        'protocol': self._source_proto(insrv),
-                        'username': self._username(insrv.username, email),
-                        'auth_type': str(insrv.authentication),
-                        'host': str(insrv.hostname),
-                        'port': str(insrv.port),
-                    })
+                    for auth in insrv.authentication:
+                        result['sources'].append({
+                            'protocol': self._source_proto(insrv),
+                            'username': self._username(insrv.username, email),
+                            'auth_type': str(auth),
+                            'host': str(insrv.hostname),
+                            'port': str(insrv.port)})
                 for outsrv in data.emailProvider.outgoingServer:
-                    result['routes'].append({
-                        'protocol': self._route_proto(outsrv),
-                        'username': self._username(outsrv.username, email),
-                        'auth_type': str(outsrv.authentication),
-                        'host': str(outsrv.hostname),
-                        'port': str(outsrv.port),
-                    })
+                    for auth in outsrv.authentication:
+                        result['routes'].append({
+                            'protocol': self._route_proto(outsrv),
+                            'username': self._username(outsrv.username, email),
+                            'auth_type': str(auth),
+                            'host': str(outsrv.hostname),
+                            'port': str(outsrv.port)})
                 result['sources'].sort(key=self._rank)
                 result['routes'].sort(key=self._rank)
                 return result
         except (IOError, ValueError, AttributeError):
-            # don't forget to delete this
-            # import traceback
-            # traceback.print_exc()
             return None
 
     def _get_ispdb(self, email, domain):
@@ -579,7 +612,7 @@ class SetupGetEmailSettings(TestableWebbable):
 
         self._progress(_('Checking ISPDB for %s') % domain)
         settings = self._get_xml_autoconfig(
-            self.ISPDB_URL % {'domain': domain}, email)
+            self.ISPDB_URL % {'domain': domain}, domain, email)
         if settings:
             self._log_result(_('Found %s in ISPDB') % domain)
             return settings
@@ -589,7 +622,7 @@ class SetupGetEmailSettings(TestableWebbable):
             # FIXME: Make a longer list of 2nd-level public TLDs to ignore
             if domain not in ('co.uk', 'pagekite.me'):
                 return self._get_xml_autoconfig(
-                    self.ISPDB_URL % {'domain': domain}, email)
+                    self.ISPDB_URL % {'domain': domain}, domain, email)
         return None
 
     def _want_anonymity(self):
@@ -627,7 +660,7 @@ class SetupGetEmailSettings(TestableWebbable):
                     self._progress(_('Checking for autoconfig on %s') % dom)
                     settings = self._get_xml_autoconfig(
                         url % {'protocol': protocol, 'domain': dom, 'email': email},
-                        email)
+                        dom, email)
                     if settings:
                         self._log_result(_('Found autoconfig on %s') % dom)
                         return settings
@@ -790,11 +823,12 @@ class SetupGetEmailSettings(TestableWebbable):
 
         if settings['protocol'].startswith('smtp'):
             try:
-                assert(SendMail(self.session, None,
-                                [(email,
-                                  [email, 'test@mailpile.is'], None,
-                                  [event])],
-                                test_only=True, test_route=settings))
+                safe_assert(
+                    SendMail(self.session, None,
+                             [(email,
+                               [email, 'test@mailpile.is'], None,
+                               [event])],
+                             test_only=True, test_route=settings))
                 return True, True
             except (IOError, OSError, AssertionError, SendMailError):
                 pass
@@ -916,13 +950,18 @@ class SetupGetEmailSettings(TestableWebbable):
 
     def setup_command(self, session):
         results = {}
-        self.deadline = time.time() + float(self.data.get('timeout', [10])[0])
+        args = list(self.args)
+        self.deadline = time.time() + float(self.data.get('timeout', [60])[0])
         self.tracking_id = self.data.get('track-id', [None])[0]
         self.password = self.data.get('password', [None])[0]
-        emails = list(self.args) + self.data.get('email', [])
+        if not self.password and len(args) > 1:
+            self.password = args.pop(-1)
+
+        emails = args + self.data.get('email', [])
         if self.password and len(emails) != 1:
             return self._error(_('Can only test settings for one account '
                                  'at a time'))
+
         for email in emails:
             settings = self._testing_data(self._get_email_settings,
                                           self.TEST_DATA, email)
@@ -970,7 +1009,7 @@ class SetupWelcome(TestableWebbable):
                 raise ValueError('Failed to configure i18n')
             config.prefs.language = language
             if save and not self._testing():
-                self._background_save(config=True)
+                self._background_save(config='!FORCE')
             return True
         except ValueError:
             return self._error(_('Invalid language: %s') % language)
@@ -996,6 +1035,68 @@ class SetupWelcome(TestableWebbable):
         return self._success(_('Welcome to Mailpile!'), results)
 
 
+class CreatePassword(TestableWebbable):
+    SYNOPSIS = (None, None, 'setup/mkpass', None)
+    HTTP_CALLABLE = ('GET', 'POST')
+    HTTP_POST_VARS = dict_merge(TestableWebbable.HTTP_POST_VARS, {
+        'dict': 'Word list to use'
+    })
+    PATHS = ['/etc/dictionaries-common', '/usr/dict', '/usr/share/dict']
+
+    def find_dictionaries(self):
+        dictionaries = set([])
+        for path in (p for p in self.PATHS if os.path.exists(p)):
+            for fn in (os.path.join(path, f) for f in os.listdir(path)):
+                fpath = os.path.realpath(fn)
+                ext = fpath.split('.')[-1]
+                if (not os.path.isdir(fpath)
+                        and ext not in ('aff', 'hash')):
+                    stat = os.stat(fpath)
+                    if stat.st_size > 100000:
+                        dictionaries.add((stat.st_size, fpath))
+        return sorted(list(dictionaries))
+
+    def load_dictionary(self, dpath, maxlen=6):
+        return list(w for w in open(dpath, 'rb')
+                    if "'" not in w and ' ' not in w and len(w) <= (maxlen+1))
+
+    def setup_command(self, session):
+        from mailpile.crypto.aes_utils import getrandbits
+        from math import log
+
+        dictionaries = self.find_dictionaries()
+        dictionary = dictionaries[-1][1]
+        words = self.load_dictionary(dictionary, maxlen=6)
+        wanted_bits = 64
+        passphrase = []
+        results = {
+            'dictionaries': dictionaries,
+            'dictionary': dictionary
+        }
+
+        # This is our random word generation; first we shuffle the
+        # dictionary (poorly), because we're going to only use the first
+        # power of 2 words.
+        random.shuffle(words)
+
+        # Figure out how many bits index neatly into the file
+        filebits = int(log(len(words), 2))
+        filemask = (2 ** filebits) - 1
+
+        # Encode strongly random bits using the shuffled dictionary
+        while wanted_bits > 0:
+            wanted_bits -= filebits
+            word = words[getrandbits(filebits) & filemask].strip().lower()
+            passphrase.append(word.decode('utf-8'))
+
+        results.update({
+            'dictionary_bits': filebits,
+            'passphrase': ' '.join(passphrase),
+            'bits': filebits * len(passphrase)
+        })
+        return self._success(_('Welcome to Mailpile!'), results)
+
+
 class SetupPassword(TestableWebbable):
     SYNOPSIS = (None, None, 'setup/password', None)
     HTTP_CALLABLE = ('GET', 'POST')
@@ -1005,33 +1106,38 @@ class SetupPassword(TestableWebbable):
         'password2': 'Confirmation password'
     })
 
+    PASSWORD_LOCK = CryptoLock()
+
     def setup_command(self, session):
         config = session.config
         current_passphrase = config.passphrases['DEFAULT']
         need_password = current_passphrase.is_set()
-        mismatch = done = False
+        incorrect = mismatch = done = False
         if self.data.get('_method') == 'POST' or self._testing():
+            with SetupPassword.PASSWORD_LOCK:
+                if need_password:
+                    ex = self.data.get('existing', [''])[0]
+                    if not current_passphrase.compare(ex):
+                        incorrect = True
+                        time.sleep(1)
 
-            if need_password:
-                ex = self.data.get('existing', [''])[0]
-                if not current_passphrase.compare(ex):
+                if not incorrect:
+                    p1 = self.data.get('password1', [''])[0]
+                    p2 = self.data.get('password2', [''])[0]
+                    if p1 and p2 and p1 == p2:
+                        config.passphrases['DEFAULT'].set_passphrase(p1)
+                        config.prefs.gpg_recipient = '!PASSWORD'
+                        self.make_master_key()
+                        self._background_save(config='!FORCE')
+                        mailpile.auth.LogoutAll()
+                        done = True
+                else:
                     mismatch = True
-
-            if not mismatch:
-                p1 = self.data.get('password1', [''])[0]
-                p2 = self.data.get('password2', [''])[0]
-                if p1 and p2 and p1 == p2:
-                    config.passphrases['DEFAULT'].set_passphrase(p1)
-                    config.prefs.gpg_recipient = '!PASSWORD'
-                    self.make_master_key()
-                    self._background_save(config=True)
-                    done = True
-            else:
-                mismatch = True
 
         results = {
             'need_password': need_password,
             'configured': done,
+            'incorrect': incorrect,
             'mismatch': mismatch
         }
         return self._success(_('Welcome to Mailpile!'), results)
@@ -1059,7 +1165,7 @@ class SetupTestRoute(TestableWebbable):
 
         if route_id:
             route = self.session.config.routes[route_id]
-            assert(route)
+            safe_assert(route)
         else:
             route = {}
             for k in CONFIG_RULES['routes'][1]:
@@ -1076,16 +1182,17 @@ class SetupTestRoute(TestableWebbable):
         if not fromaddr or '@' not in fromaddr:
             fromaddr = '%s@%s' % (route.get('username', 'test'),
                                   route.get('host', 'example.com'))
-        assert(fromaddr)
+        safe_assert(fromaddr)
 
         error_info = {'error': _('Unknown error')}
         try:
-            assert(SendMail(self.session, None,
-                            [(fromaddr,
-                              [fromaddr, 'test@mailpile.is'],
-                              None,
-                              [self.event])],
-                            test_only=True, test_route=route))
+            safe_assert(
+                SendMail(self.session, None,
+                         [(fromaddr,
+                           [fromaddr, 'test@mailpile.is'],
+                           None,
+                           [self.event])],
+                         test_only=True, test_route=route))
             return self._success(_('Route is working'),
                                  result=route)
         except OSError:
@@ -1139,7 +1246,7 @@ class SetupTor(TestableWebbable):
             with ConnBroker.context(need=need_tor) as context:
                 motd = urlopen(MOTD_URL_TOR_ONLY_NO_MARS,
                                data=None, timeout=10).read()
-                assert(motd.strip().endswith('}'))
+                safe_assert(motd.strip().endswith('}'))
             session.config.sys.proxy.protocol = 'tor'
             message = _('Successfully configured and enabled Tor!')
         except (IOError, AssertionError):
@@ -1209,8 +1316,6 @@ class Setup(SetupWelcome):
         # Perform any required migrations
         Migrate(session).run(before_setup=True, after_setup=False)
 
-
-
         # Set language from environment
         if not session.config.prefs.language:
             lang = os.getenv('LANG', '').split('.')[0] or 'en'
@@ -1238,14 +1343,15 @@ class Setup(SetupWelcome):
 
         # Perform any required migrations
         Migrate(session).run(before_setup=False, after_setup=True)
-	session.config.save()
+
+        session.config.save()
 	        # Basic app config, tags, plugins, etc.
         self.basic_app_config(session,
                               save_and_update_workers=False,
                               want_daemons=want_daemons)
+
         session.config.save()
         session.config.prepare_workers(session, daemons=want_daemons)
-        
 
         return self._success(_('Performed initial Mailpile setup'))
 
@@ -1263,6 +1369,7 @@ _ = gettext
 _plugins.register_commands(SetupMagic,
                            SetupGetEmailSettings,
                            SetupWelcome,
+                           CreatePassword,
                            SetupPassword,
                            SetupTestRoute,
                            SetupTor,

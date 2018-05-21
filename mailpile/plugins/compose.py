@@ -13,11 +13,10 @@ from mailpile.eventlog import Event
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
 from mailpile.plugins import PluginManager
-from mailpile.plugins.tags import Tag
-from mailpile.mailutils import ExtractEmails, ExtractEmailAndName, Email
-from mailpile.mailutils import NotEditableError, AddressHeaderParser
-from mailpile.mailutils import NoFromAddressError, PrepareMessage
-from mailpile.mailutils import MakeMessageID
+from mailpile.mailutils import NoFromAddressError, NotEditableError
+from mailpile.mailutils.addresses import AddressHeaderParser
+from mailpile.mailutils.emails import ExtractEmailAndName, Email
+from mailpile.mailutils.emails import PrepareMessage, MakeMessageID
 from mailpile.search import MailIndex
 from mailpile.smtp_client import SendMail
 from mailpile.urlmap import UrlMap
@@ -117,7 +116,7 @@ def AddComposeMethods(cls):
             msgid = '<%s>' % msgid.replace('_', '@')
             etype = etype.lower()
 
-            enc_msgid = idx.encode_msg_id(msgid)
+            enc_msgid = idx._encode_msg_id(msgid)
             msg_idx = idx.MSGIDS.get(enc_msgid)
             if msg_idx is not None:
                 # Already actualized, just return a normal Email
@@ -279,10 +278,10 @@ class CompositionCommand(AddComposeMethods(Search)):
             if tag:
                 self._tag_blank(emails, untag=True)
                 self._tag_drafts(emails)
-                self._background_save(index=True)
             self.message = _('%d message(s) edited') % len(emails)
         else:
             self.message = _('%d message(s) created') % len(emails)
+        self._background_save(index=True)
         session.ui.mark(self.message)
         return self._return_search_results(self.message, emails,
                                            expand=emails,
@@ -318,8 +317,8 @@ class Compose(CompositionCommand):
     """Create a new blank e-mail for editing"""
     SYNOPSIS = ('C', 'compose', 'message/compose', "[ephemeral]")
     ORDER = ('Composing', 0)
-    HTTP_CALLABLE = ('POST', )
-    HTTP_POST_VARS = dict_merge(CompositionCommand.UPDATE_STRING_DATA, {
+    HTTP_CALLABLE = ('POST', 'GET')
+    HTTP_QUERY_VARS = dict_merge(CompositionCommand.UPDATE_STRING_DATA, {
         'cid': 'canned response metadata-ID',
     })
 
@@ -338,7 +337,7 @@ class Compose(CompositionCommand):
             local_id, lmbox = session.config.open_local_mailbox(session)
         else:
             local_id, lmbox = -1, None
-            ephemeral = ['new-%s-mail' % msgid[1:-1].replace('@', '_')]
+            ephemeral = ['new-E-%s-mail' % msgid[1:-1].replace('@', '_')]
         profiles = session.config.vcards.find_vcards([], kinds=['profile'])
         return (Email.Create(idx, local_id, lmbox,
                              save=(not ephemeral),
@@ -351,11 +350,14 @@ class Compose(CompositionCommand):
 
     def command(self):
         if 'mid' in self.data:
-            return self._error(_('Please use update for editing messages'))
+            return self._error('Please use update for editing messages')
 
         session, idx = self.session, self._idx()
-        ephemeral = (self.args and "ephemeral" in self.args)
         cid = self.data.get('cid', [None])[0]
+
+        ephemeral = (self.args and "ephemeral" in self.args)
+        if self.data.get('_method', 'POST') != 'POST':
+            ephemeral = True
 
         email, ephemeral = self.CreateMessage(idx, session, self._new_msgid(),
                                               cid=cid,
@@ -552,6 +554,10 @@ class Reply(RelativeCompose):
                 else:
                     break
 
+        # Make sure GET does not change backend state, allow on CLI.
+        if self.data.get('_method', 'POST') != 'POST':
+            ephemeral = True
+
         refs = [Email(idx, i) for i in self._choose_messages(args)]
         if refs:
             try:
@@ -654,6 +660,10 @@ class Forward(RelativeCompose):
                 else:
                     break
 
+        # Make sure GET does not change backend state
+        if self.data.get('_method', 'POST') != 'POST':
+            ephemeral = True
+
         if ephemeral and with_atts:
             raise UsageError(_('Sorry, ephemeral messages cannot have '
                                'attachments at this time.'))
@@ -740,12 +750,16 @@ class Attach(CompositionCommand):
                 err(_('Error attaching to %s') % subject)
                 self._ignore_exception()
 
+        file_list = ', '.join(f.decode('utf-8') for f in files)
         if errors:
             self.message = _('Attached %s to %d messages, failed %d'
-                             ) % (', '.join(files), len(updated), len(errors))
+                             ) % (file_list, len(updated), len(errors))
         else:
             self.message = _('Attached %s to %d messages'
-                             ) % (', '.join(files), len(updated))
+                             ) % (file_list, len(updated))
+
+        if updated:
+            self._background_save(index=True)
 
         session.ui.notify(self.message)
         return self._return_search_results(self.message, updated,
@@ -809,6 +823,9 @@ class UnAttach(CompositionCommand):
             self.message = _('Removed %s from %d messages'
                              ) % (', '.join(atts), len(updated))
 
+        if updated:
+            self._background_save(index=True)
+
         session.ui.notify(self.message)
         return self._return_search_results(self.message, updated,
                                            expand=updated, error=errors)
@@ -841,7 +858,7 @@ class Sendit(CompositionCommand):
         for rcpt in (self.data.get('to', []) +
                      self.data.get('cc', []) +
                      self.data.get('bcc', [])):
-            bounce_to.extend(ExtractEmails(rcpt))
+            bounce_to.extend(AddressHeaderParser(rcpt).addresses_list())
 
         sender = self.data.get('from', [None])[0]
         if not sender and bounce_to:
@@ -920,8 +937,8 @@ class Sendit(CompositionCommand):
             # FIXME: Also fatal, when the SMTP server REJECTS the mail
             except:
                 # We want to try that again!
-                to = email.get_msg().get('x-mp-internal-rcpts',
-                                         '').split(',')[0]
+                to = email.get_msg(pgpmime=False).get('x-mp-internal-rcpts',
+                                                      '').split(',')[0]
                 if to:
                     message = _('Could not send mail to %s') % to
                 else:
@@ -949,6 +966,7 @@ class Sendit(CompositionCommand):
                 email.reset_caches()
                 idx.index_email(self.session, email)
 
+            self._background_save(index=True)
             return self._return_search_results(
                 _('Sent %d messages') % len(sent), sent, sent=sent)
         else:
@@ -989,6 +1007,7 @@ class Update(CompositionCommand):
 
             if outbox:
                 self._create_contacts(emails)
+                self._background_save(index=True)
                 return self._return_search_results(message, emails,
                                                    sent=emails)
             else:
@@ -1035,6 +1054,7 @@ class UnThread(CompositionCommand):
         if emails:
             for email in emails:
                 idx.unthread_message(email.msg_mid())
+            self._background_save(index=True)
             return self._return_search_results(
                 _('Unthreaded %d messages') % len(emails), emails)
         else:

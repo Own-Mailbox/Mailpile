@@ -48,16 +48,17 @@ class CryptoInfo(dict):
     def _set_status(self, value):
         if value not in self.STATUSES:
             print 'Bogus status for %s: %s' % (type(self), value)
-        assert(value in self.STATUSES)
+            raise ValueError('Invalid status: %s' % value)
         self._status = value
         self.mix_bubbles()
 
     def __setitem__(self, item, value):
-        assert(item in self.KEYS)
+        if item not in self.KEYS:
+            raise KeyError('Invalid key: %s' % item)
         if item == "status":
             if value not in self.STATUSES:
                 print 'Bogus status for %s: %s' % (type(self), value)
-            assert(value in self.STATUSES)
+                raise ValueError('Invalid value for %s: %s' % (key, value))
             if self._status is None:  # Capture initial value
                 self._status = value
         dict.__setitem__(self, item, value)
@@ -94,7 +95,7 @@ class CryptoInfo(dict):
     def _mix_in(self, ci):
         """
         This generates a mixed state for the message. The most exciting state
-        is returned/explained, the status prfixed with "mixed-". How exciting
+        is returned/explained, the status prefixed with "mixed-". How exciting
         states are, is determined by the order of the STATUSES attribute.
 
         This is lossy, but hopefully in a useful and non-harmful way.
@@ -129,8 +130,11 @@ class SignatureInfo(CryptoInfo):
     KEYS = (CryptoInfo.KEYS + ["name", "email", "keyinfo", "timestamp"])
     STATUSES = (CryptoInfo.STATUSES +
                 ["mixed-unknown", "unknown",
+                 "mixed-changed", "changed",  # TOFU; not the key we expected!
+                 "mixed-unsigned", "unsigned",  # TOFU; should be signed!
                  "mixed-expired", "expired",
                  "mixed-revoked", "revoked",
                  "mixed-unverified", "unverified",
+                 "mixed-signed", "signed",  # TOFU; signature matches history
                  "mixed-verified", "verified",
                  "mixed-invalid", "invalid"])

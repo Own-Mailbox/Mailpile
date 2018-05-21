@@ -3,23 +3,23 @@ import gettext
 import locale
 import os
 import sys
-from subprocess import call
+import traceback
 
-from mailpile.vcard import VCardLine, VCardStore, MailpileVCard, AddressInfo
 import mailpile.util
 import mailpile.config.defaults
+import mailpile.platforms
 from mailpile.commands import COMMANDS, Command, Action
 from mailpile.config.manager import ConfigManager
 from mailpile.conn_brokers import DisableUnbrokeredConnections
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
 from mailpile.plugins import PluginManager
-from mailpile.plugins.core import Help, HelpSplash, Load, Rescan, Quit
+from mailpile.plugins.core import Help, HelpSplash, HealthCheck
+from mailpile.plugins.core import Load, Rescan, Quit
 from mailpile.plugins.motd import MessageOfTheDay
+from mailpile.plugins.setup_magic import Setup
 from mailpile.ui import ANSIColors, Session, UserInteraction, Completer
 from mailpile.util import *
-from math import *
-from mailpile.plugins.contacts import AddProfile, ListProfiles, AddVCard, VCardCommand, ProfileVCard
 
 _plugins = PluginManager(builtin=__file__)
 
@@ -34,6 +34,25 @@ readline = None
 
 
 ##[ Main ]####################################################################
+
+
+def threaded_raw_input(prompt):
+    """These shenigans are necessary to let Quit work reliably."""
+    def reader(container):
+        try:
+            line = raw_input(prompt).decode('utf-8').strip()
+            container.append(line)
+        except EOFError:
+            pass
+    o = []
+    t = threading.Thread(target=reader, args=(o,))
+    t.daemon = True
+    t.start()
+    while t.isAlive() and not mailpile.util.QUITTING:
+        t.join(timeout=1)
+    if not o:
+        raise EOFError()
+    return o[0]
 
 
 def CatchUnixSignals(session):
@@ -86,12 +105,16 @@ def Interact(session):
         prompt = session.ui.term.color('mailpile> ',
                                        color=session.ui.term.BLACK,
                                        weight=session.ui.term.BOLD,
-                                       readline=True)
+                                       readline=(readline is not None))
         while not mailpile.util.QUITTING:
             try:
                 with session.ui.term:
+                    if Setup.Next(session.config, 'anything') != 'anything':
+                        session.ui.notify(
+                            _('Mailpile is unconfigured, please run `setup`'
+                              ' or visit the web UI.'))
                     session.ui.block()
-                    opt = raw_input(prompt).decode('utf-8').strip()
+                    opt = threaded_raw_input(prompt)
             except KeyboardInterrupt:
                 session.ui.unblock(force=True)
                 session.ui.notify(_('Interrupted. '
@@ -109,9 +132,9 @@ def Interact(session):
                     session.ui.block()
                     session.ui.display_result(result)
                 except UsageError, e:
-                    session.error(unicode(e))
+                    session.fatal_error(unicode(e))
                 except UrlRedirectException, e:
-                    session.error('Tried to redirect to: %s' % e.url)
+                    session.fatal_error('Tried to redirect to: %s' % e.url)
     except EOFError:
         print
     finally:
@@ -122,7 +145,7 @@ def Interact(session):
             readline.write_history_file(session.config.history_file())
         else:
             safe_remove(session.config.history_file())
-    except OSError:
+    except (OSError, AttributeError):
         pass
 
 
@@ -136,8 +159,11 @@ class InteractCommand(Command):
         session, config = self.session, self.session.config
 
         session.interactive = True
-        if sys.stdout.isatty() and sys.platform[:3] != "win":
+        if mailpile.platforms.TerminalSupportsAnsiColors():
             session.ui.term = ANSIColors()
+
+        # Ensure we have a working GnuPG
+        self._gnupg().common_args(will_send_passphrase=True)
 
         # Create and start the rest of the threads, load the index.
         if config.loaded_config:
@@ -168,34 +194,9 @@ class WaitCommand(Command):
     def command(self):
         self.session.ui.display_result(HelpSplash(self.session, 'help', []
                                                   ).run(interactive=False))
-	conter = 0
-        first = 0
-	with open('/home/www-data/mail', 'rb') as fort3f3:mail=fort3f3.read()
-	mail.replace("\n", "")
-	mail=''.join(mail.splitlines())
         while not mailpile.util.QUITTING:
             time.sleep(1)
-            conter = conter + 1
-            if fmod(conter,120) == 0.0 :
-	        print "saving conf";
-	        self._background_save(everything=True)
-            if first == 0 :
-            	session2=self.session
-            	if session2.config.vcards != {} and fmod(conter,10) == 0.0:
-			cmd = './getKeyFootprint.sh'
-			p = Popen(cmd, stdout=PIPE, stderr=PIPE)
-			stdout, stderr = p.communicate()
-			footprint=''.join(stdout.splitlines())
-			if len(footprint) > 10 :
-			  	print "Setting encryption! %s %s " % (footprint,mail)
-				profiles = [session2.config.vcards.get_vcard(mail)] 
-				if len(profiles) > 0 and profiles[0] is not None :
-					print "Editing profile"	    
-            				print profiles[0];
-					profiles[0].pgp_key=footprint;
-					profiles[0].save()
-					first=1
-	return self._success(_('Did nothing much for a while'))
+        return self._success(_('Did nothing much for a while'))
 
 
 def Main(args):
@@ -217,6 +218,7 @@ def Main(args):
             if config.sys.debug:
                 session.ui.error(_('Failed to decrypt configuration, '
                                    'please log in!'))
+        HealthCheck(session, None, []).run()
         config.prepare_workers(session)
     except AccessError, e:
         session.ui.error('Access denied: %s\n' % e)
@@ -224,43 +226,55 @@ def Main(args):
 
     try:
         try:
-            shorta, longa = '', []
-            for cls in COMMANDS:
-                shortn, longn, urlpath, arglist = cls.SYNOPSIS[:4]
-                if arglist:
-                    if shortn:
-                        shortn += ':'
-                    if longn:
-                        longn += '='
-                if shortn:
-                    shorta += shortn
-                if longn:
-                    longa.append(longn.replace(' ', '_'))
+            if '--login' in args:
+                a1 = args[:args.index('--login') + 1]
+                a2 = args[len(a1):]
+            else:
+                a1, a2 = args, []
 
-            opts, args = getopt.getopt(args, shorta, longa)
-            for opt, arg in opts:
-                session.ui.display_result(Action(
-                    session, opt.replace('-', ''), arg.decode('utf-8')))
-            if args:
-                session.ui.display_result(Action(
-                    session, args[0], ' '.join(args[1:]).decode('utf-8')))
+            allopts = []
+            for argset in (a1, a2):
+                shorta, longa = '', []
+                for cls in COMMANDS:
+                    shortn, longn, urlpath, arglist = cls.SYNOPSIS[:4]
+                    if arglist:
+                        if shortn:
+                            shortn += ':'
+                        if longn:
+                            longn += '='
+                    if shortn:
+                        shorta += shortn
+                    if longn:
+                        longa.append(longn.replace(' ', '_'))
+
+                opts, args = getopt.getopt(argset, shorta, longa)
+                allopts.extend(opts)
+                for opt, arg in opts:
+                    session.ui.display_result(Action(
+                        session, opt.replace('-', ''), arg.decode('utf-8')))
+                if args:
+                    session.ui.display_result(Action(
+                        session, args[0], ' '.join(args[1:]).decode('utf-8')))
 
         except (getopt.GetoptError, UsageError), e:
-            session.error(unicode(e))
+            session.fatal_error(unicode(e))
 
-        if not opts and not args:
+        if (not allopts) and (not a1) and (not a2):
             InteractCommand(session).run()
 
     except KeyboardInterrupt:
         pass
 
+    except:
+        traceback.print_exc()
+
     finally:
-        if readline:
+        if readline is not None:
             readline.write_history_file(session.config.history_file())
 
         # Make everything in the background quit ASAP...
         mailpile.util.LAST_USER_ACTIVITY = 0
-        mailpile.util.QUITTING = True
+        mailpile.util.QUITTING = mailpile.util.QUITTING or True
 
         if config.plugins:
             config.plugins.process_shutdown_hooks()
@@ -271,11 +285,17 @@ def Main(args):
         if config.event_log:
             config.event_log.close()
 
+        session.ui.display_result(Action(session, 'cleanup', ''))
+
         if session.interactive and config.sys.debug:
             session.ui.display_result(Action(session, 'ps', ''))
 
         # Remove anything that we couldn't remove before
         safe_remove()
+
+        # Restart the app if that's what was requested
+        if mailpile.util.QUITTING == 'restart':
+            os.execv(sys.argv[0], sys.argv)
 
 
 _plugins.register_commands(InteractCommand, WaitCommand)

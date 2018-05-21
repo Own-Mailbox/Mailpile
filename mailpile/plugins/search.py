@@ -2,16 +2,19 @@ import datetime
 import json
 import re
 import time
+import traceback
 import unicodedata
 
 import mailpile.security as security
 from mailpile.commands import Command
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
-from mailpile.mailutils import Email, FormatMbxId, AddressHeaderParser
-from mailpile.mailutils import ExtractEmails, ExtractEmailAndName
+from mailpile.mailutils import MBX_ID_LEN, FormatMbxId
+from mailpile.mailutils.addresses import AddressHeaderParser
+from mailpile.mailutils.emails import Email, ExtractEmails, ExtractEmailAndName
 from mailpile.plugins import PluginManager
 from mailpile.search import MailIndex
+from mailpile.security import evaluate_signature_key_trust
 from mailpile.urlmap import UrlMap
 from mailpile.util import *
 from mailpile.ui import SuppressHtmlOutput
@@ -179,7 +182,7 @@ class SearchResults(dict):
 
         for ai in addresses:
             eid = self.idx.EMAIL_IDS.get(ai.address.lower())
-            cids.add(b36(self.idx._add_email(ai.address, name=ai.fn, eid=eid)))
+            cids.add(b36(self.idx.add_email(ai.address, name=ai.fn, eid=eid)))
 
         if msg_info:
             if not no_to:
@@ -192,7 +195,7 @@ class SearchResults(dict):
                 fe, fn = ExtractEmailAndName(msg_info[MailIndex.MSG_FROM])
                 if fe:
                     eid = self.idx.EMAIL_IDS.get(fe.lower())
-                    cids.add(b36(self.idx._add_email(fe, name=fn, eid=eid)))
+                    cids.add(b36(self.idx.add_email(fe, name=fn, eid=eid)))
 
         return sorted(list(cids))
 
@@ -206,7 +209,7 @@ class SearchResults(dict):
 
     def _msg_tags(self, msg_info):
         tids = [t for t in msg_info[MailIndex.MSG_TAGS].split(',')
-                if t and t in self.session.config.tags]
+                if t and self.session.config.tags.get(t)]
         return tids
 
     def _tag(self, tid, attributes={}):
@@ -214,8 +217,8 @@ class SearchResults(dict):
 
     _BAR = u'\u2502'
     _FORK = u'\u251c'
-    _FIRST = u'\u256d'
-    _LAST = u'\u2570'
+    _FIRST = u'\u250c'
+    _LAST = u'\u2514'
     _BLANK = u' '
     _DASH = u'\u2500'
     _TEE = u'\u252c'
@@ -309,34 +312,103 @@ class SearchResults(dict):
                 del att['part']
         return tree
 
-    def _message(self, email):
-        tree = email.get_message_tree(want=(email.WANT_MSG_TREE_PGP +
-                                            self.WANT_MSG_TREE))
-        email.evaluate_pgp(tree, decrypt=True)
+    def _troubleshoot_missing_message(self, email, tree):
+        mi = email.get_msg_info()
+        details = {"locations": []}
+        problems = []
+        for msg_ptr, mbox, fd in email.index.enumerate_ptrs_mboxes_fds(mi):
+            pf = None
+            mbox_ptr = msg_ptr[:MBX_ID_LEN]
+            mail_ptr = msg_ptr[MBX_ID_LEN:]
+            info = {
+                'msg_ptr': msg_ptr,
+                'mbox_key': mbox_ptr,
+                'mail_key': mail_ptr}
 
-        editing_strings = tree.get('editing_strings')
-        if editing_strings:
-            for key in ('from', 'to', 'cc', 'bcc'):
-                if key in editing_strings:
-                    cids = self._msg_addresses(
-                        addresses=AddressHeaderParser(
-                            unicode_data=editing_strings[key]))
-                    editing_strings['%s_aids' % key] = cids
-                    for cid in cids:
-                        if cid not in self['data']['addresses']:
-                            self['data']['addresses'
-                                         ][cid] = self._address(cid=cid)
+            if fd:
+                try:
+                    fd.read(10240)
+                except:
+                    pf = _("Failed to read message {mail_key}, {mail_desc}.")
+                    info['mail_desc'] = _('unknown error')
+            elif mbox is not None:
+                pf = _("Failed to open message {mail_key}, {mail_desc}.")
+            else:
+                pf = _("Failed to open mailbox {mbox_key}")
+
+            if mbox is not None:
+                info.update({
+                    'mail_desc': mbox.describe_msg_by_ptr(msg_ptr),
+                    'mbox_desc': unicode(mbox)})
+            if pf:
+                problems.append(pf.format(**info))
+            details["locations"].append(info)
+
+        if problems:
+            details['details'] = ' '.join(problems)
+
+        return details
+
+    def _message(self, email):
+        problem, tree = None, {}
+        try:
+            # We load the message in stages (relying on the internal cache
+            # to make this not slow), so we can report more accurately what
+            # has failed.
+            problem = _('Failed to load and parse message data.')
+            msg = email.get_msg(pgpmime=False)
+
+            problem = _('Failed process message crypto (decrypt, etc).')
+            msg = email.get_msg(pgpmime='default')
+
+            problem = _('Failed to parse message.')
+            tree = email.get_message_tree(want=(email.WANT_MSG_TREE_PGP +
+                                                self.WANT_MSG_TREE))
+
+            problem = _('Failed process message crypto (decrypt, etc).')
+            email.evaluate_pgp(tree, decrypt=True)
+
+            problem = _("Failed to evalute key trust")
+            evaluate_signature_key_trust(self.session.config, email, tree)
+
+            editing_strings = tree.get('editing_strings')
+            if editing_strings:
+                for key in ('from', 'to', 'cc', 'bcc'):
+                    problem = _("Failed to parse %s headers." % key)
+                    if key in editing_strings:
+                        cids = self._msg_addresses(
+                            addresses=AddressHeaderParser(
+                                unicode_data=editing_strings[key]))
+                        editing_strings['%s_aids' % key] = cids
+                        for cid in cids:
+                            if cid not in self['data']['addresses']:
+                                self['data']['addresses'
+                                             ][cid] = self._address(cid=cid)
+            problem = None
+
+        except Exception, e:
+            if problem:
+                problem += ' ' + _('Message may be corrupt!')
+            details = {
+                'error': unicode(e),
+                 'details': problem,
+                'traceback': traceback.format_exc(e)}
+            details.update(self._troubleshoot_missing_message(email, tree))
+            self['errors'] = self.get('errors', {})
+            self['errors'][email.msg_mid()] = details
 
         return self._prune_msg_tree(tree)
 
     def __init__(self, session, idx,
                  results=None, start=0, end=None, num=None,
                  emails=None, view_pairs=None, people=None,
-                 suppress_data=False, full_threads=True):
+                 suppress_data=False, full_threads=True,
+                 unwrap_pgp='all'):
         dict.__init__(self)
         self.session = session
         self.people = people
         self.emails = emails or []
+        self.unwrap_pgp = unwrap_pgp
         self.view_pairs = view_pairs or {}
         self.idx = idx
         self.urlmap = UrlMap(self.session)
@@ -370,6 +442,8 @@ class SearchResults(dict):
                 'total': len(results),
             },
             'search_terms': session.searched,
+            'index_capabilities': dict((c, True) for c in idx.CAPABILITIES),
+            'tag_capabilities': {},
             'address_ids': [],
             'message_ids': [],
             'view_pairs': view_pairs,
@@ -386,6 +460,15 @@ class SearchResults(dict):
             if search_tag_ids:
                 self['summary'] = ' & '.join([t.name for t
                                               in search_tags if t])
+            for attr in ('hides', 'editable', 'msg_only',
+                         'allow_add', 'allow_del'):
+                tags = [t for t in search_tags if t.get('flag_' + attr)]
+                self['tag_capabilities'][attr] = (len(tags) > 0)
+
+            templates = [t.get('template') for t in search_tags]
+            if templates and templates[0] not in ('index', '', None):
+                self['tag_capabilities']['template'] = templates[0]
+
         else:
             search_tag_ids = []
 
@@ -450,7 +533,7 @@ class SearchResults(dict):
                     self['data']['tags'][tid] = self._tag(tid,
                                                           {"searched": False})
 
-    def add_email(self, e, idxs):
+    def add_email(self, e, idxs=None):
         if e not in self.emails:
             self.emails.append(e)
         mid = e.msg_mid()
@@ -469,12 +552,14 @@ class SearchResults(dict):
     def next_set(self):
         stats = self['stats']
         return SearchResults(self.session, self.idx,
-                             start=stats['start'] - 1 + stats['count'])
+                             start=stats['start'] - 1 + stats['count'],
+                             unwrap_pgp=self.unwrap_pgp)
 
     def previous_set(self):
         stats = self['stats']
         return SearchResults(self.session, self.idx,
-                             end=stats['start'] - 1)
+                             end=stats['start'] - 1,
+                             unwrap_pgp=self.unwrap_pgp)
 
     def _fix_width(self, text, width):
         chars = []
@@ -561,7 +646,7 @@ class SearchResults(dict):
                     from_info = '%s>%s' % (from_info[:20], gg(len(thread)-pos))
 
             subject = re.sub('^(\\[[^\\]]{6})[^\\]]{3,}\\]\\s*', '\\1..] ',
-                             JE._nice_subject(m))
+                             JE._nice_subject(m.get('subject')))
             subject_width = max(1, s_width - (clen + len(msg_meta)))
             subject = self._fix_width(subject, subject_width)
             from_info = self._fix_width(from_info, f_width)
@@ -574,7 +659,7 @@ class SearchResults(dict):
 
             if mid in self['data'].get('messages', {}):
                 exp_email = self.emails[expand_ids.index(int(mid, 36))]
-                msg_tree = exp_email.get_message_tree()
+                msg_tree = exp_email.get_message_tree(pgpmime=self.unwrap_pgp)
                 text.append('-' * term_width)
                 text.append(exp_email.get_editing_string(msg_tree,
                     attachment_headers=False).strip())
@@ -589,6 +674,8 @@ class SearchResults(dict):
         if not count:
             text = ['(No messages found)']
         return '\n'.join(text) + '\n'
+
+
 ##[ Commands ]################################################################
 
 class Search(Command):
@@ -604,11 +691,13 @@ class Search(Command):
         'end': 'end position',
         'full': 'return all metadata',
         'view': 'MID/MID pairs to expand in place',
+        'parent': 'Parent folder, in browse mode',
         'context': 'refine or redisplay an older search'
     }
     IS_USER_ACTIVITY = True
     COMMAND_CACHE_TTL = 900
     CHANGES_SESSION_CONTEXT = True
+    UNWRAP_PGP = 'default'
 
     class CommandResult(Command.CommandResult):
         def __init__(self, *args, **kwargs):
@@ -652,6 +741,9 @@ class Search(Command):
         self._email_view_pairs = {}
         self._emails = []
 
+    def _idx(self, **kwargs):
+        return self.session.search_index or Command._idx(self)
+
     def state_as_query_args(self):
         try:
             return self._search_state
@@ -663,9 +755,11 @@ class Search(Command):
         session, idx = self.session, self._idx()
         self._search_args = args = []
 
+        def _viewpair(m):
+            return tuple((m.split('/') + ['*'])[:2])
+
         self._email_views = self.data.get('view', [])
-        self._email_view_pairs = dict((m.split('/')[0], m.split('/')[-1])
-                                      for m in self._email_views)
+        self._email_view_pairs = dict(_viewpair(m) for m in self._email_views)
         self._emails = []
 
         self.context = self.data.get('context', [None])[0]
@@ -728,7 +822,8 @@ class Search(Command):
             'order': [session.order],
             'start': [str(start + 1)] if start else [],
             'view': self._email_views,
-            'end': [str(start + num)] if (num != def_num) else []
+            'end': [str(start + num)] if (num != def_num) else [],
+            'parent': self.data.get('parent', '')
         }
         if self.context:
             self._search_state['context'] = [self.context]
@@ -736,7 +831,7 @@ class Search(Command):
     def _email_view_side_effects(self, emails):
         session, config, idx = self.session, self.session.config, self._idx()
         msg_idxs = [e.msg_idx_pos for e in emails]
-        if 'tags' in config:
+        if 'tags' in config and config.prefs.auto_mark_as_read:
             for tag in config.get_tags(type='unread'):
                 idx.remove_tag(session, tag._key, msg_idxs=msg_idxs)
             for tag in config.get_tags(type='read'):
@@ -746,21 +841,36 @@ class Search(Command):
                           msg_idxs=[e.msg_idx_pos for e in emails])
         return None
 
-    def _do_search(self, search=None, process_args=False):
-        session, idx = self.session, self._idx()
+    def switch_indexes(self, path):
+        if path in ('default', 'mailpile'):
+             self.session.search_index = None
+        else:
+             config = self.session.config
+             self.session.search_index = config.get_path_index(
+                 self.session, path)
 
-        if self.context is None or search or session.searched != self._search_args:
+        # Note: this falls back to default index if we set to None
+        return self._idx()
+
+    def _do_search(self, search=None, process_args=False):
+        session = self.session
+
+        if (self.context is None
+                or search
+                or session.searched != self._search_args):
             session.searched = search or []
+            want_index = 'default'
             if search is None or process_args:
                 prefix = ''
                 for arg in self._search_args:
                     if arg.endswith(':'):
-                        prefix = arg
+                        prefix = arg.lower()
                     elif ':' in arg or (arg and arg[0] in ('-', '+')):
-                        if not arg.startswith('vfs:'):
-                            arg = arg.lower()
-                        prefix = ''
-                        session.searched.append(arg)
+                        if arg.startswith('index:'):
+                            want_index = arg[6:]
+                        else:
+                            prefix = ''
+                            session.searched.append(arg.lower())
                     elif prefix and '@' in arg:
                         session.searched.append(prefix + arg.lower())
                     else:
@@ -770,21 +880,73 @@ class Search(Command):
             if not session.searched:
                 session.searched = ['all:mail']
 
+            idx = self.switch_indexes(want_index)
             context = session.results if self.context else None
             session.results = list(idx.search(session, session.searched,
                                               context=context).as_set())
+
+            if '*' in self._email_view_pairs.values():
+                # If we are auto-choosing which message from a thread to
+                # display, then we want the raw results so we can only
+                # choose from messages that matched our search. We have to
+                # save this, since the sort below may collapse the results.
+                raw_results = list(session.results)
+
+            for pmid, emid in list(self._email_view_pairs.iteritems()):
+                # Make sure all our requested messages are amongst results
+                pmid_idx = int(pmid, 36)
+                if pmid_idx not in session.results:
+                    session.results.append(pmid_idx)
+
+                if ('flat' in session.order) and emid != '*':
+                    # Flat mode doesn't really use view pairs, so also make
+                    # sure our actual view target is among results.
+                    emid_idx = int(emid, 36)
+                    if emid_idx not in session.results:
+                        session.results.append(emid_idx)
+
             if session.order:
                 idx.sort_results(session, session.results, session.order)
+        else:
+            idx = self._idx()
 
         self._emails = []
         pivot_pos = any_pos = len(session.results)
+        if self._email_view_pairs:
+            new_tids = set(
+                [t._key for t in session.config.get_tags(type='unread')])
         for pmid, emid in list(self._email_view_pairs.iteritems()):
             try:
-                emid_idx = int(emid, 36)
-                for info in idx.get_conversation(msg_idx=emid_idx):
-                    cmid = info[idx.MSG_MID]
-                    self._email_view_pairs[cmid] = emid
-                    # Calculate visibility...
+                if emid == '*':
+                    pmid_idx = int(pmid, 36)
+                    conversation = idx.get_conversation(msg_idx=pmid_idx)
+                    # Find oldest message in conversation that is unread
+                    # and matches our search criteria...
+                    matches = []
+                    for info in conversation:
+                        if new_tids & set(info[idx.MSG_TAGS].split(',')):
+                            imid_idx = int(info[idx.MSG_MID], 36)
+                            if imid_idx in raw_results:
+                                matches.append((int(info[idx.MSG_DATE], 36),
+                                                imid_idx))
+                    if matches:
+                        emid_idx = min(matches)[1]
+                        emid = b36(emid_idx)
+                    else:
+                        emid = pmid
+                        emid_idx = pmid_idx
+                    self._email_view_pairs[pmid] = emid
+                else:
+                    emid_idx = int(emid, 36)
+                    conversation = idx.get_conversation(msg_idx=emid_idx)
+
+                if 'flat' not in session.order:
+                    for info in conversation:
+                        cmid = info[idx.MSG_MID]
+                        self._email_view_pairs[cmid] = emid
+
+                # Calculate visibility...
+                for cmid in self._email_view_pairs:
                     try:
                         cpos = session.results.index(int(cmid, 36))
                     except ValueError:
@@ -797,6 +959,12 @@ class Search(Command):
                 self._emails.append(Email(idx, emid_idx))
             except ValueError:
                 self._email_view_pairs = {}
+
+        if 'flat' in (session.order or ''):
+            # Above we have guaranteed that the target message is in the
+            # result set; unset this dictionary to force a flat display
+            # of the chosen message.
+            self._email_view_pairs = {}
 
         # Adjust the visible window of results if we are expanding an
         # individual message, to guarantee visibility.
@@ -811,7 +979,7 @@ class Search(Command):
         return session, idx
 
     def cache_id(self, *args, **kwargs):
-        if self._emails:
+        if self._emails or self.session.search_index:
             return ''
         return Command.cache_id(self, *args, **kwargs)
 
@@ -843,7 +1011,8 @@ class Search(Command):
                                           num=self._num,
                                           emails=self._emails,
                                           view_pairs=self._email_view_pairs,
-                                          full_threads=full_threads)
+                                          full_threads=full_threads,
+                                          unwrap_pgp=self.UNWRAP_PGP)
         session.ui.mark(_('Prepared %d search results (context=%s)'
                           ) % (len(session.results), self.context))
         return self._success(_('Found %d results in %.3fs'
@@ -1031,7 +1200,8 @@ class Extract(Command):
         name_fmt = None
 
         args = list(self.args)
-        if args[0] in ('inline', 'inline-preview', 'preview', 'download'):
+        if args[0] in ('inline', 'inline-preview', 'preview',
+                       'get', 'download'):
             mode = args.pop(0)
 
         if len(args) > 0 and args[-1].startswith('>'):
@@ -1042,7 +1212,7 @@ class Extract(Command):
             name_fmt = args.pop(-1)[1:]
 
         if (args[0].startswith('#') or
-                args[0].startswith('part:') or
+                args[0].startswith('part-') or
                 args[0].startswith('ext:')):
             cid = args.pop(0)
         else:

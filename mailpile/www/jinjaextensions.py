@@ -56,6 +56,10 @@ class MailpileCommand(Extension):
         e.globals['is_dev_version'] = s._is_dev_version
         e.globals['is_configured'] = s._is_configured
         e.globals['version_identifier'] = s._version_identifier
+        e.filters['min'] = s._min
+        e.globals['min'] = s._min
+        e.filters['max'] = s._max
+        e.globals['max'] = s._max
         e.filters['random'] = s._random
         e.globals['random'] = s._random
         e.filters['truthy'] = s._truthy
@@ -70,6 +74,8 @@ class MailpileCommand(Extension):
         e.filters['friendly_bytes'] = s._friendly_bytes
         e.globals['friendly_number'] = s._friendly_number
         e.filters['friendly_number'] = s._friendly_number
+        e.globals['body_part_metadata'] = s._body_part_metadata
+        e.filters['body_part_metadata'] = s._body_part_metadata
         e.globals['show_avatar'] = s._show_avatar
         e.filters['show_avatar'] = s._show_avatar
         e.globals['navigation_on'] = s._navigation_on
@@ -137,6 +143,12 @@ class MailpileCommand(Extension):
         e.globals['bare_subject'] = s._bare_subject
         e.filters['bare_subject'] = s._bare_subject
 
+        # Filter the raw header list
+        e.globals['get_all'] = s._get_all
+        e.filters['get_all'] = s._get_all
+        e.globals['get_addresses'] = s._get_addresses
+        e.filters['get_addresses'] = s._get_addresses
+
         # Make unruly names a lil bit nicer
         e.globals['nice_name'] = s._nice_name
         e.filters['nice_name'] = s._nice_name
@@ -152,6 +164,8 @@ class MailpileCommand(Extension):
         # Separates Fingerprint in 4 char groups
         e.globals['nice_fingerprint'] = s._nice_fingerprint
         e.filters['nice_fingerprint'] = s._nice_fingerprint
+        e.globals['group_fingerprint'] = s._group_fingerprint
+        e.filters['group_fingerprint'] = s._group_fingerprint
 
         # Converts Filter +/- tags into arrays
         e.globals['make_filter_groups'] = s._make_filter_groups
@@ -252,11 +266,45 @@ class MailpileCommand(Extension):
 
     def _friendly_number(self, number, decimals=0):
         # See mailpile/util.py:friendly_number if this needs fixing
+        if number in ('', None, False):
+            return ''
         return friendly_number(number, decimals=decimals, base=1000)
 
     def _friendly_bytes(self, number, decimals=0):
         # See mailpile/util.py:friendly_number if this needs fixing
+        if number in ('', None, False):
+            return ''
         return friendly_number(number,
+                               decimals=decimals, base=1024, suffix='B')
+
+    def _body_part_metadata(self, bp):
+        bp = bp.split(':', 2)
+        pixels = 0
+        size = (0, 0)
+        if len(bp) < 2:
+            mimetype = 'application/octet-stream'
+        elif not bp[1]:
+            mimetype = 'text/html' if (bp[2] == 'H') else 'text/plain'
+        elif '/' in bp[1]:
+            mimetype = unsquish_mimetype(bp[1])
+        else:
+            xy = bp[1].split('x')
+            size = (int(xy[0]), int(xy[1]))
+            pixels = size[0] * size[1]
+            mimetype = 'image/jpeg'  # A lie!
+        return {
+            'filename': ((bp and bp[-1] or '').strip() or
+                         ('(%s)' % _('unnamed'))),
+            'bytes': self._friendly_bytes(int((bp and bp[0] or '0'), 16)),
+            'size': size,
+            'pixels': pixels,
+            'mimetype': mimetype}
+
+    def _friendly_hex_bytes(self, number, decimals=0):
+        # See mailpile/util.py:friendly_number if this needs fixing
+        if number in ('', None, False):
+            return ''
+        return friendly_number(int(number, 16),
                                decimals=decimals, base=1024, suffix='B')
 
     def _show_avatar(self, contact):
@@ -293,18 +341,32 @@ class MailpileCommand(Extension):
             "crypto-color-gray",
             "icon-signature-none",
             _("Not Signed"),
-            _("This data has no digital signature, which means it could "
-              "have come from anyone, not necessarily the real sender")],
+            _("This data has no digital signature, which means it could have"
+              " come from anyone, not necessarily the apparent sender")],
         "error": [
             "crypto-color-red",
-            "icon-signature-error",
+            "icon-signature-invalid",
             _("Error"),
             _("There was a weird error with this digital signature")],
         "mixed-error": [
             "crypto-color-red",
-            "icon-signature-error",
+            "icon-signature-invalid",
             _("Mixed Error"),
             _("Parts of this message have a signature with a weird error")],
+        "unsigned": [
+            "crypto-color-red",
+            "icon-signature-unknown",
+            _("Unsigned"),
+            _("This data has no digital signature, which means it could "
+              "easily have been forged. This sender usually signs their "
+              "messages, so be careful!")],
+        "mixed-unsigned": [
+            "crypto-color-red",
+            "icon-signature-unknown",
+            _("Mixed Unsigned"),
+            _("This message has no digital signature, which means it could "
+              "easily have been forged. This sender usually signs their "
+              "messages, so be careful!")],
         "invalid": [
             "crypto-color-red",
             "icon-signature-invalid",
@@ -320,14 +382,14 @@ class MailpileCommand(Extension):
             "crypto-color-red",
             "icon-signature-revoked",
             _("Revoked"),
-            _("Watch out, the digital signature was made with a key that has been "
-              "revoked - this is not a good thing")],
+            _("Watch out, the digital signature was made with a key that has"
+              " been revoked - this is not a good thing")],
         "mixed-revoked": [
             "crypto-color-red",
             "icon-signature-revoked",
             _("Mixed Revoked"),
-            _("Watch out, parts of this message were digitally signed with a key "
-              "that has been revoked")],
+            _("Watch out, parts of this message were digitally signed with a"
+              " key that has been revoked")],
         "expired": [
             "crypto-color-orange",
             "icon-signature-expired",
@@ -343,25 +405,49 @@ class MailpileCommand(Extension):
             "crypto-color-gray",
             "icon-signature-unknown",
             _("Unknown"),
-            _("The digital signature was made with an unknown key, so we can not "
-              "verify it")],
+            _("The digital signature was made with an unknown key, so we can"
+              " not verify it")],
         "mixed-unknown": [
             "crypto-color-gray",
             "icon-signature-unknown",
             _("Mixed Unknown"),
-            _("Parts of this message have a signature made with an unknown "
-              "key which we can not verify")],
+            _("Parts of this message have a signature made with an unknown"
+              " key which we can not verify")],
+        "changed": [
+            "crypto-color-orange",
+            "icon-signature-unknown",
+            _("Changed"),
+            _("The digital signature was made with an unexpected key."
+              " Be careful!")],
+        "mixed-changed": [
+            "crypto-color-orange",
+            "icon-signature-unknown",
+            _("Mixed Changed"),
+            _("Parts of this message have a digital signature that was made"
+              " with an unexpected key. Be careful!")],
         "unverified": [
             "crypto-color-blue",
             "icon-signature-unverified",
             _("Unverified"),
-            _("The signature was good but it came from a key that is not "
-              "verified yet")],
+            _("The signature was good but it came from a key that is not"
+              " verified yet")],
         "mixed-unverified": [
             "crypto-color-blue",
             "icon-signature-unverified",
             _("Mixed Unverified"),
             _("Parts of this message have an unverified signature")],
+        "signed": [
+            "crypto-color-green",
+            "icon-signature-verified",
+            _("Signed"),
+            _("The digital signature is valid and was made with a key we have"
+              " seen before. Looks good!")],
+        "mixed-signed": [
+            "crypto-color-blue",
+            "icon-signature-verified",
+            _("Mixed Signed"),
+            _("Parts of the message have a good digital signature, made with"
+              " a key we have seen before.")],
         "verified": [
             "crypto-color-green",
             "icon-signature-verified",
@@ -496,12 +582,12 @@ class MailpileCommand(Extension):
     _DEFAULT_CRYPTO_POLICY = [
         _("Automatic"),
         _("Mailpile will intelligently try to guess and suggest the best "
-          "security with this given contact")]
+          "security with the given contact")]
     _CRYPTO_POLICY = {
         "default": [
             _("Automatic"),
             _("Mailpile will intelligently try to guess and suggest the best "
-              "security with this given contact")],
+              "security with the given contact")],
         "none": [
             _("Don't Sign or Encrypt"),
             _("Messages will not be encrypted nor signed by your encryption key")],
@@ -620,6 +706,15 @@ class MailpileCommand(Extension):
                              re.sub(self.URL_RE_MAILTO, mailto_fixer,
                                     text)))
 
+    @classmethod
+    def _min(self, sequence):
+        return min(sequence)
+
+    @classmethod
+    def _max(self, sequence):
+        return max(sequence)
+
+    @classmethod
     def _random(self, sequence):
         return sequence[random.randint(0, len(sequence)-1)]
 
@@ -627,9 +722,8 @@ class MailpileCommand(Extension):
     def _truthy(cls, txt, default=False):
         return truthy(txt, default=default)
 
-    @classmethod
-    def _is_dev_version(cls):
-        return ('dev' in APPVER or 'github' in APPVER or 'test' in APPVER)
+    def _is_dev_version(self):
+        return (self.env.session.config.web.developer_mode)
 
     def _is_configured(self):
         return (self.env.session.config.prefs.web_content != "unknown")
@@ -654,7 +748,7 @@ class MailpileCommand(Extension):
     def _urlencode(self, s):
         if type(s) == 'Markup':
             s = s.unescape()
-        return Markup(urllib.quote_plus(s.encode('utf-8')))
+        return Markup(urllib.quote_plus(unicode(s).encode('utf-8')))
 
     def _selectattr(self, seq, attr, value=None):
         if value is None:
@@ -722,20 +816,39 @@ class MailpileCommand(Extension):
         return Markup(result)
 
     @classmethod
-    def _nice_subject(self, metadata):
-        if metadata['subject']:
-            output = re.sub('(?i)^((re|fw|fwd|aw|wg):\s+)+', '', metadata['subject'])
+    def _nice_subject(self, subject):
+        if subject:
+            output = re.sub('(?i)^((re|fw|fwd|aw|wg):\s+)+', '', subject)
         else:
             output = '(' + _("No Subject") + ')'
         return output
 
     @classmethod
-    def _bare_subject(self, metadata):
-        if metadata['subject']:
-            output = re.sub('(?i)^((re|fw|fwd|aw|wg):\s+|\[\S+\]\s+)+', '', metadata['subject'])
+    def _bare_subject(self, subject):
+        if subject:
+            output = re.sub('(?i)^((re|fw|fwd|aw|wg):\s+|\[\S+\]\s+)+', '', subject)
         else:
             output = '(' + _("No Subject") + ')'
         return output
+
+    @classmethod
+    def _get_all(self, pairs, name):
+        return [v for n, v in pairs if n.lower() == name.lower()]
+
+    def _get_addresses(self, pairs, name):
+        from mailpile.mailutils.addresses import AddressHeaderParser
+        config = self.env.session.config
+
+        addresses = []
+        for hdr in self._get_all(pairs, name):
+            addresses.extend(AddressHeaderParser(unicode_data=hdr))
+
+        for ai in addresses:
+            vcard = config.vcards.get_vcard(ai.address)
+            if vcard:
+                ai.merge_vcard(vcard)
+
+        return addresses
 
     @classmethod
     def _nice_name(self, name, truncate=100):
@@ -746,9 +859,9 @@ class MailpileCommand(Extension):
     @classmethod
     def _recipient_summary(self, editing_strings, addresses, truncate):
         summary_list = []
-        recipients = (editing_strings['to_aids'] +
-                      editing_strings['cc_aids'] +
-                      editing_strings['bcc_aids'])
+        recipients = (editing_strings.get('to_aids', []) +
+                      editing_strings.get('cc_aids', []) +
+                      editing_strings.get('bcc_aids', []))
         for aid in recipients:
             summary_list.append(addresses[aid].fn)
         summary = ', '.join(summary_list)
@@ -916,6 +1029,12 @@ class MailpileCommand(Extension):
             return output
         else:
             return _("No Fingerprint")
+
+    def _group_fingerprint(self, fingerprint, size=4):
+        if fingerprint:
+            return [fingerprint[i:i + size] for i in range(0, len(fingerprint), size)]
+        else:
+            return []
 
     def _make_filter_groups(self, tags):
         split = shlex.split(tags)

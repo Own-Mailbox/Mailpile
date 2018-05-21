@@ -1,35 +1,30 @@
-FROM ubuntu:14.04
+FROM debian:buster-slim
 
-# Install dependencies
-RUN apt-get update -y && \
-    apt-get install -y openssl python-imaging python-jinja2 python-lxml libxml2-dev libxslt1-dev python-pgpdump spambayes
+ENV GID 33411
+ENV UID 33411
 
-# Add code
-WORKDIR /Mailpile
-ADD . /Mailpile
+RUN apt-get update && \
+    apt-get install -y curl apt-transport-https gnupg && \
+    curl -s https://packages.mailpile.is/deb/key.asc | apt-key add - && \
+    echo "deb https://packages.mailpile.is/deb release main" | tee /etc/apt/sources.list.d/000-mailpile.list && \
+    apt-get update && \
+    apt-get install -y mailpile && \
+    # TODO Enable apache for multi users
+    # apt-get install -y mailpile-apache2
+    update-rc.d tor defaults && \
+    service tor start && \
+    groupadd -g $GID mailpile && \
+    useradd -u $UID -g $GID -m mailpile && \
+    su - mailpile -c 'mailpile setup' && \
+    apt-get clean
 
-# Create users and groups
-RUN groupadd -r mailpile \
-    && mkdir -p /mailpile-data/.gnupg \
-    && useradd -r -d /mailpile-data -g mailpile mailpile
-
-# Add GnuPG placeholder file
-RUN touch /mailpile-data/.gnupg/docker_placeholder
-
-# Fix permissions
-RUN chown -R mailpile:mailpile /Mailpile
-RUN chown -R mailpile:mailpile /mailpile-data
-
-# Run as non-privileged user
+WORKDIR /home/mailpile
 USER mailpile
 
-# Initialize mailpile
-RUN ./mp setup
-
-# Entrypoint
-CMD ./mp --www=0.0.0.0:33411 --wait
+VOLUME /home/mailpile/.local/share/Mailpile
+VOLUME /home/mailpile/.gnupg
 EXPOSE 33411
 
-# Volumes
-VOLUME /mailpile-data/.local/share/Mailpile
-VOLUME /mailpile-data/.gnupg
+ENTRYPOINT ["service tor start;","mailpile"]
+CMD ["--www=0.0.0.0:33411/","--wait"]
+

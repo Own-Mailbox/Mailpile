@@ -1,5 +1,9 @@
 import os
+import ssl
+import traceback
 
+from mailpile.auth import IndirectPassword
+from mailpile.conn_brokers import Master as ConnBroker
 from mailpile.mail_source import BaseMailSource
 from mailpile.mailboxes import pop3
 from mailpile.mailutils import FormatMbxId, MBX_ID_LEN
@@ -8,23 +12,57 @@ from mailpile.i18n import ngettext as _n
 from mailpile.util import *
 
 
-def _open_pop3_mailbox(event, host, port, username, password, protocol, debug):
+# We use this to enable "recent mode" on GMail accounts by default.
+GMAIL_TLDS = ('gmail.com', 'googlemail.com')
+
+
+def _open_pop3_mailbox(session, event, host, port,
+                       username, password, auth_type,
+                       protocol, debug, throw=False):
     cev = event.data['connection'] = {
         'live': False,
         'error': [False, _('Nothing is wrong')]
     }
     try:
-        return pop3.MailpileMailbox(host,
-                                    port=port,
-                                    user=username,
-                                    password=password,
-                                    use_ssl=protocol,
-                                    debug=debug)
+        # FIXME: Nothing actually adds gmail or gmail-full to the protocol
+        #        yet, so we're stuck in recent mode only for now.
+        if (username.lower().split('@')[-1] in GMAIL_TLDS
+                or 'gmail' in protocol):
+            if 'gmail-full' not in protocol:
+                username = 'recent:%s' % username
+
+        if 'ssl' in protocol:
+            need = [ConnBroker.OUTGOING_POP3S]
+        else:
+            need = [ConnBroker.OUTGOING_POP3]
+
+        with ConnBroker.context(need=need):
+            return pop3.MailpileMailbox(host,
+                                        port=port,
+                                        user=username,
+                                        password=password,
+                                        auth_type=auth_type,
+                                        use_ssl=('ssl' in protocol),
+                                        session=session,
+                                        debug=debug)
     except AccessError:
-        cev['error'] = ['auth', _('Invalid username or password')]
+        cev['error'] = ['auth', _('Invalid username or password'),
+                        username, sha1b64(password)]
+    except (ssl.CertificateError, ssl.SSLError):
+        cev['error'] = ['tls', _('Failed to make a secure TLS connection'),
+                        '%s:%s' % (host, port)]
     except (IOError, OSError):
         cev['error'] = ['network', _('A network error occurred')]
+        event.data['traceback'] = traceback.format_exc()
+
+    if throw:
+        raise throw(cev['error'][1])
+
     return None
+
+
+class POP3_IOError(IOError):
+    pass
 
 
 class Pop3MailSource(BaseMailSource):
@@ -89,12 +127,15 @@ class Pop3MailSource(BaseMailSource):
 
     def open_mailbox(self, mbx_id, mfn):
         my_cfg = self.my_config
-        if mfn.startswith('src:') and FormatMbxId(mbx_id) in my_cfg.mailbox:
+        if 'src:' in mfn[:5] and FormatMbxId(mbx_id) in my_cfg.mailbox:
             debug = ('pop3' in self.session.config.sys.debug) and 99 or 0
-            return _open_pop3_mailbox(self.event,
+            password = IndirectPassword(self.session.config, my_cfg.password)
+            return _open_pop3_mailbox(self.session, self.event,
                                       my_cfg.host, my_cfg.port,
-                                      my_cfg.username, my_cfg.password,
-                                      my_cfg.protocol, debug)
+                                      my_cfg.username, password,
+                                      my_cfg.auth_type,
+                                      my_cfg.protocol, debug,
+                                      throw=POP3_IOError)
         return None
 
     def discover_mailboxes(self, paths=None):
@@ -109,15 +150,29 @@ class Pop3MailSource(BaseMailSource):
     def is_mailbox(self, fn):
         return False
 
+    def _mailbox_name(self, path):
+        return _("Inbox")
+
+    def _create_tag(self, *args, **kwargs):
+        ptag = kwargs.get('parent')
+        try:
+            if ptag:
+                return self.session.config.get_tags(ptag)[0]._key
+        except (IndexError, KeyError):
+            pass
+        return BaseMailSource._create_tag(self, *args, **kwargs)
+
 
 def TestPop3Settings(session, settings, event):
-    conn = _open_pop3_mailbox(event,
+    password = IndirectPassword(session.config, settings['password'])
+    conn = _open_pop3_mailbox(session, event,
                               settings['host'],
                               int(settings['port']),
                               settings['username'],
-                              settings['password'],
-                              'ssl' in settings['protocol'],
-                              False)
+                              password,
+                              settings.get('auth_type', 'password'),
+                              settings['protocol'],
+                              True)
     if conn:
         conn.close()
         return True

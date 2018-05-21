@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import mailpile.security as security
 from mailpile.commands import Command
 from mailpile.i18n import gettext as _
@@ -37,6 +38,8 @@ _plugins.register_config_section('tags', ["Tags", {
     'flag_hides': ['Hide tagged messages from searches?', 'bool', False],
     'flag_editable': ['Mark tagged messages as editable?', 'bool', False],
     'flag_msg_only': ['Never apply to entire conversations', 'bool', False],
+    'flag_allow_add': ['Allow users to apply this tag', 'bool', True],
+    'flag_allow_del': ['Allow users to remove this tag', 'bool', True],
 
     # Tag display attributes for /in/tag or searching in:tag
     'template': ['Default tag display template', 'str', 'index'],
@@ -53,6 +56,7 @@ _plugins.register_config_section('tags', ["Tags", {
                                           'archive', 'invisible'], 'tag'],
     'display_order': ['Order in lists', 'float', 0],
     'parent': ['ID of parent tag, if any', 'str', ''],
+    'notify_new': ['Notify users about new messages', 'bool', False],
 
     # Automation settings
     'auto_after': ['After N days, perform automatic action', 'int', 0],
@@ -174,14 +178,41 @@ def GetTagID(cfg, tn):
     return tags and (len(tags) == 1) and tags[0]._key or None
 
 
+def GuessTags(cfg, name):
+    tags = set()
+    name = name.lower()
+    # When guessing tag/folder names not in localized language
+    # let's also try some common mappings/translations
+    # FIXME: decide how to tread 'trash' folders on servers
+    TYPICAL_FOLDER_NAMES = {u'gesendet': 'sent',
+                            u'gelöscht': 'trash',
+                            u'entwürfe': 'drafts',
+                            u'spamverdacht': 'spam',
+                            u'éléments envoyés': 'sent',
+                            u'éléments supprimés': 'trash',
+                            u'brouillons': 'drafts',
+    }
+    try:
+        tname = TYPICAL_FOLDER_NAMES[name]
+    except KeyError:
+        tname = ''
+    for tagtype in ('inbox', 'drafts', 'sent', 'spam'):
+        for tag in cfg.get_tags(type=tagtype):
+            if (name.endswith(tag.name.lower()) or
+                    name.endswith(_(tag.name).lower()) or
+                    tname.endswith(tag.name.lower())):
+                tags.add(tag._key)
+    return tags
+
+
 def Slugify(tag_name, tags=None):
-    slug = CleanText(tag_name.lower().replace(' ', '-'),
+    slug = CleanText(tag_name.lower().replace(' ', '-').replace('@', '-'),
                      banned=CleanText.NONDNS.replace('/', '')
                      ).clean.lower()
     n = 1
     while tags and slug in [t.slug for t in tags.values()]:
         n += 1
-        slug = Slugify('%s-%s' % (tag_name, n))
+        slug = Slugify('%s.%s' % (tag_name, n))
     return slug
 
 
@@ -226,6 +257,7 @@ mailpile.config.manager.ConfigManager.get_tag = GetTag
 mailpile.config.manager.ConfigManager.get_tags = GetTags
 mailpile.config.manager.ConfigManager.get_tag_id = GetTagID
 mailpile.config.manager.ConfigManager.get_tag_info = GetTagInfo
+mailpile.config.manager.ConfigManager.guess_tags = GuessTags
 mailpile.config.manager.ConfigManager.get_filters = GetFilters
 mailpile.config.manager.ConfigManager.filter_move = FilterMove
 mailpile.config.manager.ConfigManager.filter_delete = FilterDelete
@@ -251,7 +283,7 @@ class TagCommand(Command):
 
 class Tag(TagCommand):
     """Add or remove tags on a set of messages"""
-    SYNOPSIS = (None, 'tag', 'tag', '[--conversations|--messages] '
+    SYNOPSIS = (None, 'tag', 'tag', '[--conversations|--messages|--force] '
                                     '<[+|-]tags> <msgs>')
     ORDER = ('Tagging', 0)
     HTTP_CALLABLE = ('POST', )
@@ -260,7 +292,8 @@ class Tag(TagCommand):
         'add': 'tags',
         'del': 'tags',
         'conversations': '[yes|no|auto]',
-        'context': 'search context, for tagging relative results'
+        'context': 'search context, for tagging relative results',
+        'force': 'Force changes'
     }
     COMMAND_SECURITY = security.CC_TAG_EMAIL
 
@@ -293,6 +326,7 @@ class Tag(TagCommand):
         adding = set(self.data.get('add', []))
         ops = (['-%s' % t for t in (deling-adding) if t] +
                ['+%s' % t for t in (adding-deling) if t])
+        force = truthy(self.data.get('force', ['no'])[0])
         conversations = truthy(self.data.get('conversations', ['auto'])[0],
                                special={'auto': None})
         if 'mid' in self.data:
@@ -302,6 +336,8 @@ class Tag(TagCommand):
                 op = words.pop(0)
                 if op in ('--conversations', '--messages'):
                     conversations = True if (op[:3] == '--c') else False
+                elif op == '--force':
+                    force = True
                 else:
                     ops.append(op)
 
@@ -324,13 +360,15 @@ class Tag(TagCommand):
         msg_ids = self._choose_messages(words)
         return expanded_ops, msg_ids, conversations
 
-    def _do_tagging(self, ops, msg_ids, conversations, save=True, auto=False):
+    def _do_tagging(self, ops, msg_ids, conversations,
+                    save=True, auto=False, force=False):
         idx = self._idx()
         rv = {
             'conversations': False,
             'msg_ids': [b36(i) for i in msg_ids],
             'tagged': [],
-            'untagged': []
+            'untagged': [],
+            'ignored': []
         }
 
         for op in ops:
@@ -349,28 +387,44 @@ class Tag(TagCommand):
                 if conversation:
                     rv['conversations'] = True
 
+                ignored = False
                 tag_id = tag._key
+                tag_cfg = tag
                 tag = tag.copy()
                 tag["tid"] = tag_id
                 if op[0] == '-':
-                    removed = idx.remove_tag(self.session, tag_id,
-                                             msg_idxs=msg_ids,
-                                             conversation=conversation)
-                    rv['untagged'].append((tag, sorted([b36(i)
-                                                        for i in removed])))
+                    if force or tag_cfg['flag_allow_del']:
+                        removed = idx.remove_tag(self.session, tag_id,
+                                                 msg_idxs=msg_ids,
+                                                 conversation=conversation)
+                        rv['untagged'].append(
+                            (tag, sorted([b36(i) for i in removed])))
+                    else:
+                        rv['ignored'].append((op, tag))
+                        ignored = True
                 else:
-                    added = idx.add_tag(self.session, tag_id,
-                                        msg_idxs=msg_ids,
-                                        conversation=conversation)
-                    rv['tagged'].append((tag, sorted([b36(i)
-                                                      for i in added])))
+                    if force or tag_cfg['flag_allow_add']:
+                        added = idx.add_tag(self.session, tag_id,
+                                            msg_idxs=msg_ids,
+                                            conversation=conversation)
+                        rv['tagged'].append(
+                            (tag, sorted([b36(i) for i in added])))
+                    else:
+                        rv['ignored'].append((op, tag))
+                        ignored = True
+
                 # Record behavior
-                if len(msg_ids) < 15:
+                if len(msg_ids) < 15 and not ignored:
                     for t in self.session.config.get_tags(type='tagged',
                                                           default=[]):
                         idx.add_tag(self.session, t._key, msg_idxs=msg_ids)
             else:
                 self.session.ui.warning('Unknown tag: %s' % op)
+
+
+        if rv['ignored'] and (len(rv['tagged']) == len(rv['untagged']) == 0):
+            self.event.private_data['ignored'] = rv['ignored']
+            return self._error(_('Nothing Happened'), result=rv)
 
         if rv['conversations']:
             undo_msg = _n('Untag %d conversation',
@@ -385,11 +439,14 @@ class Tag(TagCommand):
             done_msg = _n('Tagged %d message',
                           'Tagged %d messages', len(msg_ids)) % len(msg_ids)
 
+        rv['undo_msg'] = undo_msg
         self.event.data['undo'] = undo_msg
         self.event.private_data['undo'] = {
             'tagged': [[t['tid'], mids] for t, mids in rv['tagged']],
             'untagged': [[t['tid'], mids] for t, mids in rv['untagged']],
         }
+        if rv['ignored']:
+            self.event.private_data['ignored'] = rv['ignored']
 
         self.finish(save=save)
         return self._success(done_msg, rv)
@@ -459,18 +516,25 @@ class AddTag(TagCommand):
         'slug': 'tag slug',
         # Optional initial attributes of tags
         'icon': 'icon-tag',
+        'type': 'Internal tag type',
         'label': 'display as label in search results, or not',
         'label_color': 'the color of the label',
         'display': 'tag display type',
+        'toolbar': 'display in toolbar?',
         'template': 'tag template type',
         'search_terms': 'default search associated with this tag',
         'magic_terms': 'magic search terms associated with this tag',
         'parent': 'parent tag ID',
+        'auto_tag': 'enable or disable auto-tagging',
+        'auto_after': 'perform auto-action after this time',
+        'auto_action': 'auto-action to perform',
     }
     COMMAND_SECURITY = security.CC_CHANGE_TAGS
 
-    OPTIONAL_VARS = ['icon', 'label', 'label_color', 'display', 'template',
-                     'search_terms', 'parent']
+    OPTIONAL_VARS = ['icon', 'type', 'parent',
+                     'display', 'toolbar', 'label', 'label_color',
+                     'template', 'search_terms', 'magic_terms',
+                     'auto_tag', 'auto_after', 'auto_action']
 
     class CommandResult(TagCommand.CommandResult):
         def as_text(self):
@@ -568,11 +632,11 @@ class ListTags(TagCommand):
                             + ((i % wrap) == (wrap - 1) and '\n' or ''))
             return ''.join(text) + '\n'
 
-    def command(self):
+    def command(self, **kwargs):
         result, idx = [], self._idx()
 
         args = []
-        search = {}
+        search = kwargs
         for arg in self.args:
             if '=' in arg:
                 kw, val = arg.split('=', 1)
@@ -681,6 +745,7 @@ class DeleteTag(TagCommand):
         session, config = self.session, self.session.config
         clean_session = mailpile.ui.Session(config)
         clean_session.ui = session.ui
+        clean_session.order = 'all-flat'
         result = []
 
         tag_names = []
@@ -698,9 +763,10 @@ class DeleteTag(TagCommand):
 
                 # FIXME: Refuse to delete tag if in use by filters
 
-                rv = (Search(clean_session, arg=['tag:%s' % tag_id]).run() and
-                      Tag(clean_session, arg=['-%s' % tag_id, 'all']).run())
-                if rv:
+                msgs = set(config.index.TAGS.get(tag_id, set()))
+                rem = config.index.remove_tag(clean_session, tag_id,
+                                              msg_idxs=msgs)
+                if not config.index.TAGS.get(tag_id, set()):
                     del config.tags[tag_id]
                     result.append({'name': tag.name, 'tid': tag_id})
                 else:
@@ -716,7 +782,7 @@ class DeleteTag(TagCommand):
 
 class TagAutomation(Command):
     """Perform automatically scheduled tasks for one or more tags"""
-    SYNOPSIS = (None, 'tags/auto', 'tags/auto', '[-force|-test] <-all|tags ...>')
+    SYNOPSIS = (None, 'tags/auto', 'tags/auto', '[--force|--test] <-all|tags ...>')
     ORDER = ('Tagging', 9)
     HTTP_CALLABLE = ('POST', )
     HTTP_POST_VARS = {}
@@ -751,8 +817,8 @@ class TagAutomation(Command):
         session, config = self.session, self.session.config
         args = list(self.args)
 
-        force = '-force' in args
-        dry_run = '-test' in args
+        force = ('-force' in args) or ('--force' in args)
+        dry_run = ('-test' in args) or ('--test' in args)
 
         today = time.time() // (24 * 3600)
         results = []

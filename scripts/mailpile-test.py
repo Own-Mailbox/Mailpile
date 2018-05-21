@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python2.7
 #
 # This script runs a set of black-box tests on Mailpile using the test
 # messages found in `testing/`.
@@ -76,6 +76,8 @@ def say(stuff):
 
 
 def do_setup():
+    # Set it first to avoid interactive prompt for a passphrase
+    config.passphrases['DEFAULT'].set_passphrase('mailpile')
     # Set up initial tags and such
     mp.setup()
     mp.profiles_add(MY_FROM, '=', MY_NAME)
@@ -170,7 +172,7 @@ def test_load_save_rescan():
                    ['from:brennan', 'subject:encrypted',
                     'testing', 'purposes', 'only', 'tag:mp_enc-decrypted'],
                    ['from:brennan', 'subject:signed',
-                    'tag:mp_sig-unverified'],
+                    'tag:mp_sig-expired'],
                    ['from:barnaby', 'subject:testing', 'soup',
                     'tag:mp_sig-unknown', 'tag:mp_enc-decrypted'],
                    ['from:square', 'subject:here', '-has:attachment'],
@@ -180,7 +182,9 @@ def test_load_save_rescan():
                    ):
         say('Searching for: %s' % search)
         results = mp.search(*search)
-        assert(results.result['stats']['count'] == 1)
+        if results.result['stats']['count'] != 1:
+            raise AssertionError(
+                'Count = %s != 1' % results.result['stats']['count'])
 
     say('Checking size of inbox')
     mp.order('flat-date')

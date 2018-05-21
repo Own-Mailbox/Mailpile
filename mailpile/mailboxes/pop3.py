@@ -4,6 +4,8 @@ except ImportError:
     import StringIO
 
 import poplib
+import socket
+import ssl
 import time
 from mailbox import Mailbox, Message
 
@@ -15,6 +17,25 @@ from mailpile.mailboxes import UnorderedPicklable
 from mailpile.util import *
 
 
+class wrappable_POP3_SSL(poplib.POP3_SSL):
+    """
+    Override the default poplib.POP3_SSL init to use socket.create_connection
+    """
+    def __init__(self, host,
+                 port=poplib.POP3_SSL_PORT, keyfile=None, certfile=None,
+                 timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+        self.host = host
+        self.port = port
+        self.keyfile = keyfile
+        self.certfile = certfile
+        self.buffer = ""
+        self.sock = socket.create_connection((host, port), timeout)
+        self.file = self.sock.makefile('rb')
+        self.sslobj = ssl.wrap_socket(self.sock, self.keyfile, self.certfile)
+        self._debugging = 0
+        self.welcome = self._getresp()
+
+
 class UnsupportedProtocolError(Exception):
     pass
 
@@ -24,21 +45,30 @@ class POP3Mailbox(Mailbox):
     Basic implementation of POP3 Mailbox.
     """
     def __init__(self, host,
-                 user=None, password=None, use_ssl=True, port=None,
-                 debug=False, conn_cls=None):
+                 user=None, password=None, auth_type='password',
+                 use_ssl=True, port=None, debug=False, conn_cls=None,
+                 session=None):
         """Initialize a Mailbox instance."""
         Mailbox.__init__(self, '/')
         self.host = host
         self.user = user
         self.password = password
+        self.auth_type = auth_type
         self.use_ssl = use_ssl
         self.port = port
         self.debug = debug
         self.conn_cls = conn_cls
+        self.session = session
 
         self._lock = MboxRLock()
         self._pop3 = None
         self._connect()
+
+    def lock(self):
+        pass
+
+    def unlock(self):
+        pass
 
     def _connect(self):
         with self._lock:
@@ -51,22 +81,36 @@ class POP3Mailbox(Mailbox):
 
             with ConnBroker.context(need=[ConnBroker.OUTGOING_POP3]):
                 if self.conn_cls:
-                    self._pop3 = self.conn_cls(self.host, self.port or 110)
+                    self._pop3 = self.conn_cls(self.host, self.port or 110,
+                                               timeout=120)
                     self.secure = self.use_ssl
                 elif self.use_ssl:
-                    self._pop3 = poplib.POP3_SSL(self.host, self.port or 995)
+                    self._pop3 = wrappable_POP3_SSL(self.host, self.port or 995,
+                                                    timeout=120)
                     self.secure = True
                 else:
-                    self._pop3 = poplib.POP3(self.host, self.port or 110)
+                    self._pop3 = poplib.POP3(self.host, self.port or 110,
+                                             timeout=120)
                     self.secure = False
 
+            if hasattr(self._pop3, 'sock'):
+                self._pop3.sock.settimeout(120)
             if self.debug:
                 self._pop3.set_debuglevel(self.debug)
 
             self._keys = None
             try:
-                self._pop3.user(self.user)
-                self._pop3.pass_(self.password)
+                if self.auth_type.lower() == 'oauth2':
+                    from mailpile.plugins.oauth import OAuth2
+                    token_info = OAuth2.GetFreshTokenInfo(self.session,
+                                                          self.user)
+                    if self.user and token_info and token_info.access_token:
+                        raise AccessError("FIXME: Do OAUTH2 Auth!")
+                    else:
+                        raise AccessError()
+                else:
+                    self._pop3.user(self.user)
+                    self._pop3.pass_(self.password)
             except poplib.error_proto:
                 raise AccessError()
 
@@ -136,6 +180,16 @@ class POP3Mailbox(Mailbox):
                 raise KeyError('Invalid key: %s' % key)
             ok, info, octets = self._pop3.list(self._km[key]).split()
             return int(octets)
+
+    def remove(self, key):
+        # FIXME: This is very inefficient if we are deleting multiple
+        #        messages at once.
+        with self._lock:
+            self._connect()
+            if key not in self.iterkeys():
+                raise KeyError('Invalid key: %s' % key)
+            ok = self._pop3.dele(self._km[key])
+            self._refresh()
 
     def stat(self):
         with self._lock:

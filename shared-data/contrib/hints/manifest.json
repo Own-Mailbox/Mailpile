@@ -1,0 +1,50 @@
+# This is a Mailpile plugin manifest, describing the `hints` plugin.
+#
+{
+    "name": "hints",
+    "author": "The Mailpile Team <team@mailpile.is>",
+    "description": "Incremental learning! This plugin provides periodic tips and hints on how to make the most of your Mailpile.",
+    "display": true,
+    "public": true,
+    "code": {
+        "python": ["hints.py"],
+        "javascript": ["hints.js"]
+    },
+    "routes": {
+        "/logs/hints/": {"file": "hints.html"},
+        "/page/hints/deletion.html": {"file": "hints/deletion.html"},
+        "/page/hints/backups.html": {"file": "hints/backups.html"},
+        "/page/hints/gravatar.html": {"file": "hints/gravatar.html"},
+        "/page/hints/organize-sidebar.html": {"file": "hints/organize-sidebar.html"},
+        "/page/hints/spam.html": {"file": "hints/spam.html"},
+        "/page/hints/spambayes.html": {"file": "hints/spambayes.html"},
+        "/page/hints/keyboard-shortcuts.html": {"file": "hints/keyboard-shortcuts.html"},
+        "/page/hints/autotagging.html": {"file": "hints/autotagging.html"}
+    },
+    "user_interface": {
+        "activities": [
+            {
+                "context": [
+                    "/logs/events/",
+                    "/logs/network/",
+                    "/logs/hints/",
+                    "/settings/",
+                    "/settings/set/password/",
+                    "/crypto/tls/getcert/"
+                ],
+                "name": "hints",
+                "text": "Hints",
+                "icon": "lightbulb",
+                "description": "Tips and tricks",
+                "url": "/logs/hints/"
+            }
+        ]
+    },
+    "commands": [
+        {
+            "class": "hintsCommand",
+            "url": "logs/hints",
+            "name": "hints"
+        }
+    ]
+}

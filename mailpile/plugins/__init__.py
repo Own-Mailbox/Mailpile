@@ -23,10 +23,11 @@ from mailpile.util import *
 __all__ = [
     'core',
     'eventlog', 'search', 'tags', 'contacts', 'compose', 'groups',
-    'dates', 'sizes', 'autotag', 'cryptostate', 'crypto_gnupg',
-    'setup_magic', 'exporters', 'plugins', 'motd',
-    'vcard_carddav', 'vcard_gnupg', 'vcard_mork', 'html_magic', 'migrate', 'smtp_server', 'crypto_policy',
-    'keylookup'
+    'dates', 'sizes', 'autotag', 'cryptostate', 'crypto_gnupg', 'gui',
+    'setup_magic', 'oauth', 'exporters', 'plugins', 'motd', 'backups',
+    'vcard_carddav', 'vcard_gnupg', 'vcard_gravatar', 'vcard_libravatar',
+    'vcard_mork', 'html_magic', 'migrate', 'smtp_server', 'crypto_policy',
+    'keylookup', 'webterminal'
 ]
 PLUGINS = __all__
 
@@ -35,6 +36,20 @@ class EmailTransform(object):
     """Base class for e-mail transforms"""
     def __init__(self, config):
         self.config = config
+
+    def _get_sender_profile(self, sender, kwargs):
+        profile = kwargs.get('sender_profile')
+        if not profile:
+            profile = self.config.get_profile(sender)
+        return profile
+
+    def _get_first_part(self, msg, mimetype):
+        for part in msg.walk():
+             if not part.is_multipart():
+                 mimetype = (part.get_content_type() or 'text/plain').lower()
+                 if mimetype == 'text/plain':
+                     return part
+        return None
 
     def TransformIncoming(self, *args, **kwargs):
         return list(args[:]) + [False]
@@ -62,12 +77,12 @@ class PluginManager(object):
     REQUIRED = [
         'core',
         'eventlog', 'search', 'tags', 'contacts', 'compose', 'groups',
-        'dates', 'sizes', 'cryptostate', 'setup_magic', 'html_magic',
-        'plugins', 'keylookup', 'motd'
+        'dates', 'sizes', 'cryptostate', 'setup_magic', 'oauth', 'html_magic',
+        'plugins', 'keylookup', 'motd', 'backups', 'gui'
     ]
     # Plugins we want, if they are discovered
     WANTED = [
-        'autoajax', 'print', 'datadig'
+        'autoajax', 'print', 'hints'
     ]
     # Plugins that have been renamed from past releases
     RENAMED = {
@@ -126,7 +141,7 @@ class PluginManager(object):
                 try:
                     with open(manifest_filename) as mfd:
                         manifest = json.loads(self._uncomment(mfd.read()))
-                        assert(manifest.get('name') == subdir)
+                        safe_assert(manifest.get('name') == subdir)
                         # FIXME: Need more sanity checks
                         self.DISCOVERED[pname] = (plug_path, manifest)
                 except (ValueError, AssertionError):
@@ -152,7 +167,7 @@ class PluginManager(object):
                 sys.modules[mp] = imp.new_module(mp)
                 sys.modules[module].__dict__[parent] = sys.modules[mp]
             module = mp
-        assert(module == full_name)
+        safe_assert(module == full_name)
 
         # load actual module
         sys.modules[full_name].__file__ = full_path
@@ -163,7 +178,7 @@ class PluginManager(object):
     def _load(self, plugin_name, process_manifest=False, config=None):
         full_name = 'mailpile.plugins.%s' % plugin_name
         if full_name in sys.modules:
-            return
+            return self
 
         self.loading_plugin = full_name
         if plugin_name in self.BUILTIN:
@@ -200,7 +215,9 @@ class PluginManager(object):
             except:
                 traceback.print_exc(file=sys.stderr)
                 print 'FIXME: Loading %s failed, tell user!' % full_name
-                return
+                if full_name in sys.modules:
+                    del sys.modules[full_name]
+                return None
 
             spec = (full_name, manifest, dirname)
             self.manifests.append(spec)
@@ -209,7 +226,7 @@ class PluginManager(object):
                 self._process_manifest_pass_two(*spec)
                 self._process_startup_hooks(*spec)
         else:
-            print 'What what what?? %s' % plugin_name
+            print 'Unrecognized plugin: %s' % plugin_name
             return self
 
         if plugin_name not in self.LOADED:
@@ -698,8 +715,8 @@ class PluginManager(object):
 
     def register_worker(self, thread_obj):
         self._compat_check()
-        assert(hasattr(thread_obj, 'start'))
-        assert(hasattr(thread_obj, 'quit'))
+        safe_assert(hasattr(thread_obj, 'start'))
+        safe_assert(hasattr(thread_obj, 'quit'))
         # FIXME: complain about duplicates?
         self.WORKERS.append(thread_obj)
 
@@ -754,7 +771,7 @@ class PluginManager(object):
     def register_ui_element(self, ui_type,
                             context=None, name=None,
                             text=None, icon=None, description=None,
-                            url=None, javascript_setup=None, 
+                            url=None, javascript_setup=None,
                             javascript_events=None, **kwargs):
         name = name.replace('/', '_')
         if name not in [e.get('name') for e in self.UI_ELEMENTS[ui_type]]:

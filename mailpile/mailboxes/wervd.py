@@ -7,7 +7,7 @@ import sys
 import mailpile.mailboxes
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
-from mailpile.mailboxes import UnorderedPicklable
+from mailpile.mailboxes import UnorderedPicklable, MBX_ID_LEN
 from mailpile.crypto.streamer import *
 from mailpile.util import safe_remove
 
@@ -40,6 +40,12 @@ class MailpileMailbox(UnorderedPicklable(mailbox.Maildir, editable=True)):
     def __init2__(self, *args, **kwargs):
         open(os.path.join(self._path, 'wervd.ver'), 'w+b').write('0')
 
+    def __unicode__(self):
+        return _("Mailpile mailbox at %s") % self._path
+
+    def _describe_msg_by_ptr(self, msg_ptr):
+        return _("e-mail in file %s") % self._lookup(msg_ptr[MBX_ID_LEN:])
+
 # FIXME: Copies
 #   def _copy_paths(self, where, key, copies):
 #       for cpn in range(1, copies):
@@ -71,10 +77,12 @@ class MailpileMailbox(UnorderedPicklable(mailbox.Maildir, editable=True)):
 
     def _get_fd(self, key):
         with self._lock:
-            fd = open(os.path.join(self._path, self._lookup(key)), 'rb')
+            fn = os.path.join(self._path, self._lookup(key))
             mep_key = self._decryption_key_func()
+        fd = open(fn, 'rb')
         if mep_key:
-            fd = DecryptingStreamer(fd, mep_key=mep_key, name='WERVD')
+            fd = DecryptingStreamer(fd, mep_key=mep_key,
+                                    name='WERVD(%s)' % fn)
         return fd
 
     def get_message(self, key):
@@ -133,12 +141,13 @@ class MailpileMailbox(UnorderedPicklable(mailbox.Maildir, editable=True)):
             self._dump_message(message, es)
             es.finish()
 
-            # We are using the MD5 to detect file system corruption, not in a
+            # We are using the MAC to detect file system corruption, not in a
             # security context - so using as little as 40 bits should be fine.
             saved = False
             key = None
-            for l in range(10, len(es.outer_md5sum)):
-                key = es.outer_md5sum[:l]
+            outer_mac = es.outer_mac_sha256()
+            for l in range(10, len(outer_mac)):
+                key = outer_mac[:l]
                 fn = os.path.join(self._path, 'new', key)
                 if not os.path.exists(fn):
                     es.save(fn)

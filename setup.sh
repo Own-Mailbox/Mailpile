@@ -16,14 +16,14 @@ rm -r ~/.local/share/Mailpile/
 ./mp --www=127.0.0.1:33411/Mailpile/
 ./mp --setup
 sleep 1;
-cat setup-commands | ./mp 
+cat setup-commands | ./mp
 sleep 10
 python2.7 setup-account.py
 cp last-commands last-commands.tmp
 sed -i "s/MAIL/$1/g" last-commands.tmp
 #user=$(echo $1 | cut -f1 -d"@")
 #sed -i "s/mailpile/$user/g" last-commands.tmp
-cat last-commands.tmp | ./mp 
+cat last-commands.tmp | ./mp
 echo "!!!!!!!!!!!!!!!!!!! Search mailbox !!!!!!!!!!!!!!!!"
 cat bug_workaround | ./mp
 ./mp --www=127.0.0.1:33411/Mailpile/ --wait >mailpile.log 2>&1 </dev/null &
@@ -34,4 +34,3 @@ history -c
 echo "finend"
 exec >&-
 exec 2>&-
-

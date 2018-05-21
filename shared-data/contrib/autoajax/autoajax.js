@@ -30,7 +30,9 @@ ajaxable_url = function(url) {
              (url.indexOf(U("/browse/")) == 0) ||
              (url.indexOf(U("/thread/")) == 0) ||
              (url.indexOf(U("/profiles/")) == 0) ||
+             (url.indexOf(U("/message/compose/")) == 0) ||
              (url.indexOf(U("/settings/")) == 0) ||
+             (url.indexOf(U("/crypto/tls/getcert/")) == 0) ||
              (url.indexOf(U("/logs/")) == 0) ||
              (url.indexOf(U("/page/")) == 0) ||
              (url.indexOf(U("/search/")) == 0)
@@ -41,14 +43,11 @@ _outerHTML = function(elem) {
     return $('<div />').append(elem.clone()).html();
 };
 
-_update_title = function(message) {
-    var ct = document.title;
-    suffix = ct.substring(ct.indexOf('|') - 1);
-    document.title = message + suffix;
-};
-
-_scroll_up = function(elem) {
-    setTimeout(function() { $(elem).scrollTop(0); }, 10);
+_scroll_up = function(elem, scrollto) {
+    setTimeout(function() {
+      $(elem).find('div, table, tbody, p').scrollTop(0);
+      $('#content-view, #content-tall-view').eq(0).scrollTop(scrollto || 0);
+    }, 10);
 };
 
 get_now = function() {
@@ -57,11 +56,44 @@ get_now = function() {
 };
 
 clear_selection_state = function() {
-    // FIXME: Is this sufficient?
-    Mailpile.UI.Selection.select_none();
+  Mailpile.UI.Selection.select_none();
+};
+
+get_selection_state = function() {
+  var selected = Mailpile.UI.Selection.selected('.pile-results');
+  var elements = {};
+  $.each(selected, function() {
+    if (this != '!all') {
+      elements[this] = $('.pile-results .pile-message-' + this).eq(0).clone();
+    }
+  });
+  return {
+    selected: selected,
+    elements: elements
+  };
+};
+
+restore_selection_state = function(sstate) {
+  if (sstate.selected.length) {
+    $.each(sstate.selected.reverse(), function() {
+      if (this != '!all') {
+        if ($('.pile-results .pile-message-' + this).length < 1) {
+          var elem = sstate.elements[this];
+          if (elem && $(elem).find('.message-container').length < 1) {
+            $('.pile-results .pile-message').eq(0).parent().prepend(elem);
+          }
+        }
+      }
+      Mailpile.pile_action_select($('.pile-results .pile-message-' + this), 'partial');
+    });
+    Mailpile.bulk_actions_update_ui();
+  }
 };
 
 can_refresh = function(cid) {
+    // Disable checks below (experimental)
+    return (Mailpile.ui_in_action < 1);
+
     // By default we disable all refreshes of the UI if the user is busy
     // selecting or rearranging or dragging... .
     // FIXME: Hmm, seems other parts of the app should be able to block
@@ -72,16 +104,36 @@ can_refresh = function(cid) {
             ($('.pile-results input[type=checkbox]:checked').length < 1));
 };
 
-autoajax_go = function(url, message, jhtml, noblank) {
+autoajax_go = function(url, message, jhtml, noblank, noscroll, selrestore) {
     url = Mailpile.fix_url(url);
     if (jhtml === undefined) jhtml = ajaxable_url(url);
-    // If we have any composers on the page, save contents
-    // before continuing - whether we're JHTMLing or not!
+
+    // Provide UI feedback if this takes time
     var done = Mailpile.notify_working(message, (noblank) ? 250 : 1500);
+
+    // Attempt to preserve selections cross-refresh.
+    var selected = get_selection_state();
+
+    // If noscroll is requested, try to preserve scroll position.
+    if (noscroll) {
+      scrollto = $('#content-view, #content-tall-view').eq(0).scrollTop();
+    }
+    else scrollto = 0;
+
+    // Called after the page is updated
     var scroll_and_done = function(stuff) {
       done();
-      return _scroll_up(stuff);
+      if (selrestore) {
+        restore_selection_state(selected);
+      }
+      else {
+        clear_selection_state(selected);
+      }
+      return _scroll_up(stuff, scrollto);
     }
+
+    // If we have any composers on the page, save contents
+    // before continuing - whether we're JHTMLing or not!
     Mailpile.Composer.AutosaveAll(0, function() {
         if (!(jhtml && update_using_jhtml(url, scroll_and_done, done, noblank))) {
             document.location.href = url;
@@ -97,14 +149,18 @@ prepare_new_content = function(selector) {
         if (url &&
                 (url.indexOf('#') != 0) &&
                 (url.indexOf('mailto:') != 0) &&
+                (url.indexOf('javascript:') != 0) &&
                 (elem.target != '_blank') &&
                 (elem.className.indexOf('auto-modal') == -1)) {
             $(elem).click(function(ev) {
                 // We don't hijack events that spawn new tabs/windows etc.
                 if (!(ev.ctrlKey || ev.altKey || ev.shiftKey)) {
                     ev.preventDefault();
+                    var $elem = $(elem);
                     autoajax_go(url, undefined, jhtml,
-                                $(elem).data('noblank') ? true : false);
+                                $elem.data('noblank') ? true : false,
+                                $elem.data('noscroll') ? true : false,
+                                $elem.data('keep-selection') ? true : false);
                 }
             });
         }
@@ -113,7 +169,14 @@ prepare_new_content = function(selector) {
     $form.submit(function(ev) {
         // We don't hijack events that spawn new tabs/windows etc.
         if (!(ev.ctrlKey || ev.altKey || ev.shiftKey)) {
-            if (update_using_jhtml(U("/search/?") + $form.serialize(), _scroll_up)) {
+            var selected = get_selection_state();
+            if (update_using_jhtml(U("/search/?") + $form.serialize(),
+                                   function(stuff) {
+                // Always restore selection state on search, as searching
+                // is actually a moderately advanced behaviour.
+                restore_selection_state(selected);
+                return _scroll_up(stuff);
+            })) {
                 ev.preventDefault();
             }
         }
@@ -124,7 +187,7 @@ Mailpile.UI.content_setup.push(prepare_new_content);
 render_result = function(data, cv, html) {
     var cv = cv || $('#content-view, #content-tall-view').parent();
 
-    if (data) _update_title(data['message']);
+    if (data) Mailpile.update_title(data['message']);
     cv.replaceWith(html || data['result']).show();
 
     clear_selection_state();
@@ -133,6 +196,8 @@ render_result = function(data, cv, html) {
     Mailpile.render();
     // Work around bugs in drag/drop lib, nuke artefacts
     $('div.ui-draggable-dragging').remove();
+
+    return cv;
 };
 
 restore_state = function(ev) {
@@ -161,8 +226,8 @@ update_using_jhtml = function(original_url, callback, error_callback,
                 if (!nohistory)
                     history.pushState({autoajax: true, url: original_url},
                                       data['message'], original_url);
-                render_result(data, cv)
-                if (callback) { callback(cv) };
+                shown = render_result(data, cv)
+                if (callback) { callback(shown) };
             },
             error: function() {
                 if (error_callback) error_callback(cv);
@@ -186,8 +251,10 @@ refresh_from_cache = function(cid) {
              if (json.result) {
                  var cid = json.state.cache_id;
                  if (can_refresh(cid)) {
-                     $('.content-'+cid).replaceWith(json.result);
+                     var selected = get_selection_state();
+                     $('.content-'+cid).replaceWith(json.result.trim());
                      Mailpile.UI.prepare_new_content('.content-'+cid);
+                     restore_selection_state(selected);
                      refresh_history[cid] = get_now();
                      // Work around bugs in drag/drop lib, nuke artefacts
                      $('div.ui-draggable-dragging').remove();

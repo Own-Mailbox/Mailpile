@@ -2,6 +2,8 @@ import random
 import threading
 import time
 
+from markupsafe import escape
+
 import mailpile.util
 from mailpile.i18n import gettext as _
 from mailpile.i18n import ngettext as _n
@@ -54,6 +56,7 @@ class VCardLine(dict):
         ",": "\\,",
         ";": "\\;",
         "\n": "\\n",
+        "\r": "\\r",
     }
     QUOTE_RMAP = dict([(v, k) for k, v in QUOTE_MAP.iteritems()])
 
@@ -870,7 +873,8 @@ class MailpileVCard(SimpleVCard):
             with open(self.filename, 'rb') as fd:
                 with DecryptingStreamer(fd,
                                         mep_key=self.decryption_key_func(),
-                                        name='VCard/load') as streamer:
+                                        name='VCard/load(%s)' % self.filename
+                                        ) as streamer:
                     data = streamer.read().decode('utf-8')
                     streamer.verify(_raise=IOError)
         else:
@@ -943,7 +947,7 @@ class MailpileVCard(SimpleVCard):
             return {}
 
     def record_history(self, what, when, mid, now=None):
-        assert(what[0] in ('s', 'r'))
+        safe_assert(what[0] in ('s', 'r'))
         with self._lock:
             try:
                 history_vcl = self.get('x-mailpile-history')
@@ -1060,12 +1064,10 @@ class MailpileVCard(SimpleVCard):
 
         if source is None:
             if not create:
-                print "PROLEMNONE1"        
-	        return None
+                return None
             new_src_id = create if (create is not True) else randomish_uid()
             if new_src_id not in self.config.sources:
-        	print "CONFIG NEW SOURCE"
-	        self.config.sources[new_src_id] = {}
+                self.config.sources[new_src_id] = {}
             source = self.config.sources[new_src_id]
             source.name = name or ''
             source.protocol = protocol
@@ -1075,7 +1077,7 @@ class MailpileVCard(SimpleVCard):
 
             # This starts the source thread as as side-effect
             self.config.save()
-	print "OKSOURCE"
+
         return source
 
     def sources(self):
@@ -1165,7 +1167,7 @@ class AddressInfo(dict):
 
         photos = vcard.get_all('photo')
         if photos:
-            self['photo'] = photos[0].value
+            self['photo'] = escape(photos[0].value)
 
         crypto_policy = vcard.crypto_policy
         if crypto_policy:
@@ -1229,12 +1231,17 @@ class VCardStore(dict):
             for attr in attrs:
                 for n, vcl in enumerate(card.get_all(attr, sort=True)):
                     key = vcl.value.lower()
-                    if n == 0 or key not in self:
-                        if collision_callback and key in self:
-                            existing = self[key].get(attr, 0)
-                            if existing is not 0 and existing.value == key:
-                                collision_callback(key, card)
-                        self[key] = card
+                    if n == 0 or (key not in self):
+                        if key in self:
+                            if collision_callback is not None:
+                                existing = self[key].get(attr, 0)
+                                if existing is not 0 and existing.value == key:
+                                    collision_callback(key, card)
+                                self[key] = card
+                            else:
+                                pass  # Do not override existing cards
+                        else:
+                            self[key] = card
             self[card.random_uid] = card
 
     def deindex_vcard(self, card):
@@ -1276,6 +1283,8 @@ class VCardStore(dict):
                     c.load(path, config=self.config)
                     try:
                         def ccb(key, card):
+                            if card.kind == 'profile':
+                                return  # Deleting user input is never OK!
                             if session:
                                 session.ui.error('DISABLING %s, eclipses %s'
                                                  % (path, key))
@@ -1506,7 +1515,7 @@ class VCardImporter(VCardPluginClass):
         return self.config.guid
 
     def import_vcards(self, session, vcard_store, **kwargs):
-        create_profiles = kwargs.get('profiles', False)
+        update_profiles = kwargs.get('profiles', False)
         if 'profiles' in kwargs:
             del kwargs['profiles']
 
@@ -1536,6 +1545,8 @@ class VCardImporter(VCardPluginClass):
                         vcard_store.find_vcards_with_line(merge_by, vcl.value))
             last = ''
             existing.sort(key=lambda k: (k.email, k.random_uid))
+            if not update_profiles:
+                existing = [e for e in existing if e.kind != 'profile']
             for card in existing:
                 if card.random_uid == last:
                     continue
@@ -1552,7 +1563,7 @@ class VCardImporter(VCardPluginClass):
 
             # Otherwise, create new ones.
             kindhint = vcard.get('x-mailpile-kind-hint', 0)
-            if not existing and (create_profiles or
+            if not existing and (update_profiles or
                                  kindhint is 0 or
                                  kindhint.value != 'profile'):
                 try:

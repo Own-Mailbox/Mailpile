@@ -292,8 +292,8 @@ class Command(object):
         path_parts[-1] += '.' + ttype
         return os.path.join(*path_parts)
 
-    def _gnupg(self):
-        return GnuPG(self.session.config, event=self.event)
+    def _gnupg(self, **kwargs):
+        return GnuPG(self.session.config, event=self.event, **kwargs)
 
     def _config(self):
         session, config = self.session, self.session.config
@@ -348,9 +348,11 @@ class Command(object):
                          wait=False, wait_callback=None):
         session, cfg = self.session, self.session.config
         aut = cfg.save_worker.add_unique_task
-	print "saving conf real";
         if everything or config:
-            aut(session, 'Save config', lambda: cfg.save(session), first=True)
+            aut(session,
+                'Save config',
+                lambda: cfg.save(session, force=(config == '!FORCE')),
+                first=True)
         if cfg.index:
             cfg.flush_mbox_cache(session, clear=False, wait=wait)
             if index_full:
@@ -476,7 +478,9 @@ class Command(object):
                           'message': self.message or ''}
 
     def _sloppy_copy(self, data, name=None):
-        if name and 'pass' == name[:4]:
+        if name and (name[:4] in ('pass', 'csrf') or
+                     'password' in name or
+                     'passphrase' in name):
             data = '(SUPPRESSED)'
         def copy_value(v):
             try:

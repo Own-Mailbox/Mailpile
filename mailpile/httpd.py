@@ -79,6 +79,20 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
     ])
 
     _ERROR_CONTEXT = {'lastq': '', 'csrf': '', 'path': ''},
+    _NEWLINE_RE = re.compile('[\r\n]+')
+    _HTML_RE = re.compile('[<>\'\"]+')
+
+    def assert_no_newline(self, data):
+        if re.search(self._NEWLINE_RE, str(data) or '') is not None:
+            raise ValueError()
+
+    def assert_no_html(self, data):
+        if re.search(self._HTML_RE, data or '') is not None:
+            raise ValueError()
+
+    def send_header(self, hdr, value):
+        self.assert_no_newline(value)
+        return SimpleXMLRPCRequestHandler.send_header(self, hdr, value)
 
     def http_host(self):
         """Return the current server host, e.g. 'localhost'"""
@@ -104,6 +118,7 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
         session_id = self._load_cookies().get(self.server.session_cookie)
         if session_id:
             session_id = session_id.value
+            self.assert_no_newline(session_id)
         else:
             session_id = self.server.make_session_id(self)
         return session_id
@@ -120,22 +135,34 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
 
     def send_http_response(self, code, msg):
         """Send the HTTP response header"""
-        self.wfile.write('HTTP/1.1 %s %s\r\n' % (code, msg))
+        msg = '%s %s' % (code, msg)
+        self.assert_no_newline(msg)
+        self.wfile.write('HTTP/1.1 %s\r\n' % msg)
 
     def send_http_redirect(self, destination):
+        # We don't re-encode things here, we expect our input to already
+        # be well formed. However, this is the last chance to block any
+        # exploits, so we do check to make sure.
+        self.assert_no_newline(destination)
+        self.assert_no_html(destination)
         self.send_http_response(302, 'Found')
-        self.wfile.write(('Location: %s\r\n\r\n'
-                          '<h1><a href="%s">Please look here!</a></h1>\n'
-                          ) % (destination, destination))
+        body = ('<h1><a href="%s">Please look here!</a></h1>\n'
+                ) % (destination,)
+        self.wfile.write(('Location: %s\r\n'
+                          'Content-Length: %d\r\n\r\n'
+                          ) % (destination, len(body)))
+        self.wfile.write(body)
 
     def send_standard_headers(self,
                               header_list=[],
                               cachectrl='private',
-                              mimetype='text/html'):
+                              mimetype='text/html',
+                              x_dns_prefetch='off'):
         """
         Send common HTTP headers plus a list of custom headers:
         - Cache-Control
         - Content-Type
+        - X-DNS-Prefetch-Control
 
         This function does not send the HTTP/1.1 header, so
         ensure self.send_http_response() was called before
@@ -152,6 +179,8 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
         self.send_header('Content-Security-Policy',
                          security.http_content_security_policy(self.server))
         self.send_header('Content-Type', mimetype)
+        self.send_header('X-DNS-Prefetch-Control', x_dns_prefetch)
+        self.send_header('X-UA-Compatible', 'IE=Edge')  # For old Windowses
         for header in header_list:
             self.send_header(header[0], header[1])
         session_id = self.session.ui.html_variables.get('http_session')
@@ -161,7 +190,6 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
             cookies[self.server.session_cookie]['path'] = '/'
             cookies[self.server.session_cookie]['max-age'] = 24 * 3600
             self.send_header(*cookies.output().split(': ', 1))
-            self.send_header('Cache-Control', 'no-cache="set-cookie"')
         if mailpile.util.QUITTING:
             self.send_header('Connection', 'close')
         self.end_headers()
@@ -382,7 +410,7 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
             name = 'Chelsea Manning'
 
         http_session = self.http_session()
-        csrf_token = security.make_csrf_token(self, http_session)
+        csrf_token = security.make_csrf_token(self.server.secret, http_session)
         session.ui.html_variables = {
             'csrf_token': csrf_token,
             'csrf_field': ('<input type="hidden" name="csrf" value="%s">'
@@ -398,6 +426,8 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
             'url_protocol': self.headers.get('x-forwarded-proto', 'http'),
             'mailpile_size': idx and len(idx.INDEX) or 0
         }
+        session.ui.valid_csrf_token = lambda token: security.valid_csrf_token(
+            self.server.secret, http_session, token)
 
         try:
             try:
@@ -440,7 +470,10 @@ class HttpRequestHandler(SimpleXMLRPCRequestHandler):
                     else:
                         http_headers.append(('ETag', etag))
                 max_age = min(max_ages) if max_ages else 10
-                cachectrl = 'must-revalidate, no-store, max-age=%d' % max_age
+                if max_age:
+                    cachectrl = 'must-revalidate, max-age=%d' % max_age
+                else:
+                    cachectrl = 'must-revalidate, no-store, max-age=0'
 
             global LIVE_HTTP_REQUESTS
             hang_fix = 1 if ([1 for c in commands if c.IS_HANGING_ACTIVITY]
@@ -535,10 +568,13 @@ class HttpServer(SocketServer.ThreadingMixIn, SimpleXMLRPCServer):
     def finish_request(self, request, client_address):
         try:
             SimpleXMLRPCServer.finish_request(self, request, client_address)
-        except socket.error:
+        except (socket.error, AttributeError):
+            # AttributeError may get thrown if the underlying socket has
+            # already been closed elsewhere and _sock = None.
             pass
-        if mailpile.util.QUITTING:
-            self.shutdown()
+        finally:
+            if mailpile.util.QUITTING:
+                self.shutdown()
 
 
 class HttpWorker(threading.Thread):
@@ -563,6 +599,6 @@ class HttpWorker(threading.Thread):
 
     def quit(self, join=False):
         if self.httpd:
-            self.httpd.shutdown()
             self.httpd.server_close()
+            self.httpd.shutdown()
         self.httpd = None

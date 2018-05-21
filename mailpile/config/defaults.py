@@ -1,6 +1,6 @@
-APPVER = "1.0.0rc0"
+APPVER = "1.0.0rc3"
 ABOUT = """\
-Mailpile.py              a tool             Copyright 2013-2016, Mailpile ehf
+Mailpile.py              a tool             Copyright 2013-2018, Mailpile ehf
  v%8.0008s         for searching and               <https://www.mailpile.is/>
                organizing piles of e-mail
 
@@ -22,6 +22,7 @@ from mailpile.config.base import KeyConfigRule as k
 _ = lambda string: string
 
 
+DEV_MODE = ('rc' in APPVER or 'dev' in APPVER or 'github' in APPVER)
 DEFAULT_SENDMAIL = '|/usr/sbin/sendmail -i %(rcpt)s'
 CONFIG_PLUGINS = []
 CONFIG_RULES = {
@@ -31,6 +32,7 @@ CONFIG_RULES = {
     'master_key': k(_('Master symmetric encryption key'), str, ''),
     'sys': p(_('Technical system settings'), False, {
         'fd_cache_size': p(_('Max files kept open at once'), int,         500),
+        'minfree_mb':    p(_('Required free disk space (MB)'), int,      1024),
         'history_length': (_('History length (lines, <0=no save)'), int,  100),
         'http_host':     p(_('Listening host for web UI'),
                            'hostname', 'localhost'),
@@ -39,7 +41,7 @@ CONFIG_RULES = {
         'http_no_auth':  X(_('Disable HTTP authentication'),      bool, False),
         'postinglist_kb': (_('Posting list target size in KB'), int,       64),
         'sort_max':       (_('Max results we sort "well"'), int,         2500),
-        'snippet_max':    (_('Max length of metadata snippets'), int,     250),
+        'snippet_max':    (_('Max length of metadata snippets'), int,     275),
         'debug':         p(_('Debugging flags'), str,                      ''),
         'experiments':    (_('Enabled experiments'), str,                  ''),
         'gpg_keyserver':  (_('Host:port of PGP keyserver'),
@@ -78,21 +80,46 @@ CONFIG_RULES = {
         'num_results':     (_('Search results per page'), int,             20),
         'rescan_interval': (_('Misc. data refresh frequency'), int,       10),
         'open_in_browser':p(_('Open in browser on startup'), bool,       True),
+        'auto_mark_as_read': p(_('Automatically mark e-mail as read'),
+                                                                   bool, True),
         'web_content':     (_('Download content from the web'),
                             ["off", "anon", "on"],                  "unknown"),
+        'html5_sandbox':   (_('Use HTML5 sandboxes'), bool,              True),
+        'weak_crypto_max_age': (
+               _('Accept weak crypto in messages older than this (unix time)'),
+                                                                  int,      0),
+        'encrypted_block_html': (_('Never display HTML from encrypted mail'),
+                                                                   bool, True),
+        'encrypted_block_web': (_('Never fetch web content from encrypted mail'),
+                                                                   bool, True),
         'gpg_use_agent':   (_('Use the local GnuPG agent'), bool,       False),
         'gpg_clearsign':  X(_('Inline PGP signatures or attached'),
                             bool, False),
         'gpg_recipient':   (_('Encrypt local data to ...'), 'gpgkeyid',    ''),
         'gpg_email_key':   (_('Enable e-mail based public key distribution'),
                             bool, True),
+        'gpg_html_wrap':   (_('Wrap keys and signatures in helpful HTML'),
+                            bool, True),
+        'key_trust':       (_("Key Trust Model"), False, {
+            'threshold':    (_('Minimum number of signatures required'),
+                             int, 5),
+            'window_days':  (_('Window of time (days) to evaluate trust'),
+                             int, 90),
+            'sig_warn_pct': (_('Signed ratio (%) above which we expect sigs'),
+                             int, 80),
+            'key_trust_pct':(_('Ratio of key use (%) above which we trust key'),
+                             int, 90),
+            'key_new_pct':  (_('Consider key new below this ratio (%) of sigs'),
+                             int, 10)
+        }),
         'openpgp_header': X(_('Advertise PGP preferences in a header?'),
                             ['', 'sign', 'encrypt', 'signencrypt'],
                             'signencrypt'),
         'crypto_policy':  X(_('Default encryption policy for outgoing mail'),
                             str, 'none'),
         'inline_pgp':      (_('Use inline PGP when possible'), bool,     True),
-        'default_order':   (_('Default sort order'), str,     'rev-freshness'),
+        'encrypt_subject': (_('Encrypt subjects by default'), bool,      True),
+        'default_order':   (_('Default sort order'), str,          'rev-date'),
         'obfuscate_index':X(_('Key to use to scramble the index'), str,    ''),
         'index_encrypted':X(_('Make encrypted content searchable'),
                             bool, False),
@@ -101,6 +128,12 @@ CONFIG_RULES = {
         'encrypt_vcards': X(_('Encrypt the contact database'), bool,     True),
         'encrypt_events': X(_('Encrypt the event log'), bool,            True),
         'encrypt_misc':   X(_('Encrypt misc. local data'), bool,         True),
+        'allow_deletion': X(_('Allow permanent deletion of e-mails'),
+                                                                  bool, False),
+# FIXME:
+#       'backup_to_web':  X(_('Backup settings and keys to mobile web app'),
+#                                                                  bool, True),
+#       'backup_to_email':X(_('Backup settings and keys to e-mail'),  str, ''),
         'rescan_command':  (_('Command run before rescanning'), str,       ''),
         'default_email':   (_('Default outgoing e-mail address'), 'email', ''),
         'default_route':   (_('Default outgoing mail route'), str, ''),
@@ -116,6 +149,8 @@ CONFIG_RULES = {
         }],
     }),
     'web': (_("Web Interface Preferences"), False, {
+        'keybindings':     (_('Enable keyboard short-cuts'), bool, False),
+        'developer_mode':  (_('Enable developer-only features'), bool, DEV_MODE),
         'setup_complete':  (_('User completed setup experience'), bool, False),
         'display_density': (_('Display density of interface'), str, 'comfy'),
         'quoted_reply':    (_('Quote replies to messages'), str, 'unset'),
@@ -134,8 +169,13 @@ CONFIG_RULES = {
     'secrets': [_('Secrets the user wants saved'), {
         'password':        (_('A secret'), str, ''),
         'policy':          (_('Security policy'),
-                            ["store", "cache-only", "fail"],
+                            ["store", "cache-only", "fail", "protect"],
                             'store')
+    }, {}],
+    'tls': [_('Settings for TLS certificate validation'), {
+        'server':          (_('Server hostname:port'), str, ''),
+        'accept_certs':    (_('SHA256 of acceptable certs'), str, []),
+        'use_web_ca':      (_('Use web certificate authorities'), bool, True)
     }, {}],
     'routes': [_('Outgoing message routes'), {
         'name':            (_('Route name'), str, ''),
@@ -178,9 +218,10 @@ CONFIG_RULES = {
             'parent_tag':  (_('Parent tag for mailbox tags'), str, '!CREATE'),
             'guess_tags':  (_('Guess which local tags match'), bool, True),
             'create_tag':  (_('Create a tag for each mailbox?'), bool, True),
-            'visible_tags':(_('Make tags visible by default?'), bool, False),
+            'visible_tags':(_('Make tags visible by default?'), bool, True),
             'process_new': (_('Is a potential source of new mail'), bool, True),
             'apply_tags':  (_('Tags applied to messages'), str, []),
+            'max_mailboxes':(_('Max mailboxes to add'), int, 100),
         }),
         'mailbox': (_('Mailboxes'), {
             'name':        (_('The name of this mailbox'), str, ''),

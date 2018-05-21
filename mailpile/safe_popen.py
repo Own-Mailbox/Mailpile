@@ -27,6 +27,8 @@ import sys
 import thread
 import threading
 
+import mailpile.platforms
+
 
 Unsafe_Popen = subprocess.Popen
 PIPE = subprocess.PIPE
@@ -85,17 +87,18 @@ class Safe_Popen(Unsafe_Popen):
         # platforms, so we don't allow the programmer to configure them
         # at all.
         if SERIALIZE_POPEN_STRICT:
-            assert(preexec_fn is None)
-            assert(close_fds is None)
-            assert(startupinfo is None)
-            assert(creationflags is None)
+            if not ((preexec_fn is None) and
+                    (close_fds is None) and
+                    (startupinfo is None) and
+                    (creationflags is None)):
+                raise AssertionError("Unsafe use of POpen API!")
 
         # The goal of the following sections is to achieve two things:
         #
         #    1. Prevent file descriptor leaks from causing deadlocks
         #    2. Prevent signals from propagating
         #
-        if sys.platform.startswith('win'):
+        if mailpile.platforms.WindowsPopenSemantics():
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # 2.
             if (stdin is not None or
                     stdout is not None or
