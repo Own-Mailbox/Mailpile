@@ -666,7 +666,7 @@ class GnuPG:
 
     def run(self,
             args=None, gpg_input=None, outputfd=None, partial_read_ok=False,
-            send_passphrase=False, _raise=None, novercheck=False):
+            send_passphrase=True, _raise=None, novercheck=False):
         if novercheck:
             version = (1, 4)
         else:

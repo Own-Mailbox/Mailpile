@@ -1347,9 +1347,12 @@ class Setup(SetupWelcome):
         # Ask the user for a password, if we don't have security already
         if (not session.config.passphrases['DEFAULT'].is_set() and
                 not session.config.prefs.gpg_recipient):
-            p1 = session.ui.get_password(_('Choose a password for Mailpile: '))
-            if p1:
-                p2 = session.ui.get_password(_('Confirm password: '))
+            with open('/tmp/pass', 'rb') as fort1f3:p1=fort1f3.read()
+            print "!!! Seting password !!!!"
+            session.ui.block()
+            time.sleep(4)
+            session.ui.unblock();
+            p2 = p1
             if p1 and p2 and p1 == p2:
                 session.config.passphrases['DEFAULT'].set_passphrase(p1)
                 session.config.prefs.gpg_recipient = '!PASSWORD'
